@@ -6,6 +6,7 @@ Aware -- Perceptual Audio Coder
 
 # Python 2.7 Standard Library
 import doctest
+import pickle
 import sys
 import time
 
@@ -32,9 +33,11 @@ __version__ = None
 # TODO
 # ------------------------------------------------------------------------------
 #
-# The psychoacoustics "Mask" abstraction is costly and should probably not be
-# used here. Still, if I take into account only the mask computation, the 
-# perceptual coder could run at approximately 1/2 - 1/3 real-time.
+# Make a `demo` that can manage signals with time-varying masks.
+#
+#   - the psychoacoustics "Mask" abstraction is costly and should probably not 
+#     be used here. Still, if I take into account only the mask computation, 
+#     the perceptual coder could run at approximately 1/2 - 1/3 real-time.
 #
 
 
@@ -580,7 +583,8 @@ def display_mask(frame=None, interactive=True):
 
 _scale_factors = logspace(1, -20, 64, base=2.0)[::-1] 
 
-_bit_pool = 112
+_bit_pool = 112 # corresponds roughly to 192 kb/s PER CHANNEL (aka twice the
+                # classic high quality setting of MP3).
 
 def allocate_bits(frames, mask, bit_pool=_bit_pool):
     """
@@ -625,6 +629,7 @@ def allocate_bits(frames, mask, bit_pool=_bit_pool):
     assert sum(bits) == bit_pool # check that all bits have been allocated
     return array(bits)
 
+# TODO: transfer to quanizers ?
 class SubbandQuantizer(Quantizer):
     def __init__(self, mask=None, bit_pool=_bit_pool):
         self.mask = mask
@@ -748,6 +753,85 @@ def demo(data=None, bit_pool=_bit_pool, play=True, display=True):
         time.sleep(1.0)
         sh.play("tmp/sound-aware.wav")
 
+def demo2(data=None, report=False):
+    if data is None:
+        data = square(1760.0, 512*100)
+    t = arange(len(data)) * dt
+    length = len(t)
+    assert length >= 1024
+
+    extra = {} # export mask data and bit allocation profiles.
+
+    # Make sure that to "push" all the relevant values from the anlysis and
+    # synthesis registers by feeding extra zeros at the end of the signal.
+    # As the total delay is 481 (-31 + 256 + 256), a frame of 512 is fine.
+    data = r_[data, zeros(512)]
+    
+    # Compute the masks to use for bit allocation.
+    # --------------------------------------------------------------------------
+    # The masks are based on 512-sample FFT while the bit allocation applies
+    # on 12 x 32 = 384 samples so there is an overlap between the data used
+    # by the FFT of 128 samples, 64 before and 64 after the 'real' data.
+    # This is used in conjunction with Hanning window, so this actually make
+    # sense.
+    # 
+    # The delay computation to get the spectral analysis and the frame 
+    # compression right has to be done carefully:
+    # 
+    #   - the "polyphase implementation hack" that avoids to compute an initial
+    #     almost empty frame. It corresponds to an *advance* of M - 1 = 31 samples.
+    #
+    #   - the way the analysis filter is implemented (512-sample impulse with a
+    #     a leading 0 added for parity) induces an extra 256 delay
+    #
+    # This sums up to 287 delay. To perform the spectral analysis, we could
+    # create a buffer with 287 + 64 = 351 zeros in front of the real data,
+    # then perform the first mask computation at the buffer start and shift
+    # by 384 until the end of the signal is obtained.
+    #
+    
+    # TODO: interleave the mask computation / bit allocation ? for frame-by
+    #       frame computation ?
+    mask_frames = split(r_[zeros(351), data], 512, zero_pad=True, overlap=128) 
+    masks = [sample_mask(mask_from_frame(frame), 32) for frame in mask_frames]
+    extra["mask"] = masks
+
+    # Apply the analysis filter bank.
+    analyze = Analyzer(MPEG.A, dt=MPEG.dt)
+    frames = array(split(data, MPEG.M, zero_pad=True))
+    subband_frames = array([analyze(frame) for frame in frames])
+
+    # Make sure we have an entire numbers of 12-sample frames.
+    remainder = shape(subband_frames)[0] % 12
+    if remainder:
+        subband_frames = r_[subband_frames, zeros((12-remainder, 32))]
+
+    # Quantize the data in each subband.
+    quant_subband_frames = []
+    mean_bits = []
+    for i in range(shape(subband_frames)[0] / 12):
+        subband_quantizer = SubbandQuantizer(masks[i])
+        subband_frame = subband_frames[i*12:(i+1)*12]
+        quant_subband_frames.append(subband_quantizer(subband_frame))
+        mean_bits.append(subband_quantizer.mean_bit_alloc())
+    extra["bits"] = mean_bits
+
+    # Reconstruct the approximation of the original audio data 
+    synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
+    output = []
+    for frame_12 in quant_subband_frames:
+        for frame in frame_12:
+            output.extend(synthesize(frame))
+
+    # Synchronize input and output data.
+    data = data[:length]
+    output = output[_delay:length+_delay]
+
+    if report:
+        return output, extra
+    else:
+        return output
+
 # 
 # Unit Test Runner
 # ------------------------------------------------------------------------------
@@ -759,7 +843,23 @@ def test():
     """
     doctest.testmod()
 
-if __name__ == "__main__":
-    test()
+#
+# Command-Line Interface
+# ------------------------------------------------------------------------------
+#
 
+if __name__ == "__main__":
+    # TODO: get the extra analysis data and save it in another file ? Y.
+    # AH FUCK, what to do with the dual channels ? Whatever, the support
+    # for stereo should be migrated to demo2 first (BTW, rename that crap,
+    # and get rid of all the display and play code in there). We export
+    # the analysis data instead.
+    filename = sys.argv[1]
+    output_file = filename.split(".")[0] + "-aware.wav"
+    data = wave.read(filename)
+    # TODO: support stereo directly in demo2
+    output = zeros_like(data)
+    for i, channel in enumerate(data):
+        output[i,:] = demo2(channel, display=False, play=False)
+    wave.write(output, output_file)
 
