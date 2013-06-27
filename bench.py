@@ -31,6 +31,36 @@ def demo2():
         and do the same in the loop of mask_from_frame and maybe in the demo2
         calling loop. That's *probably* more efficient ...
 
+    Cython without any modification to the source produces only a minor 
+    improvement if any -- can hardly be measured. cdef'ing excitation_pattern
+    did not produce anything measurable either. So far my attempts at getting
+    more juice from Cython have been totally unsuccesful ...
+
+    I should probably try to "whiten" completely excitation_pattern to begin
+    with ... Yes, that produces some OUMPHA, with time down from 6.5 to
+    3.55. And now, 50% of the time is spent in `mask_from_frame`. And the
+    quantizer module is now taking 30% of the time ...
+
+    I try to de-vectorize excitation_pattern to be able to unroll the loops
+    in mask_from_framee, so far I am losing performance (around 8.5 sec now).
+    
+    Well, honnestly I don't get it now. I have inlined everything in a single
+    function and that's worse than the numpy/array version by a factor of 2 ...
+    While almost all the code is white ... OK, I am kinda stuck now, mask_from_frame
+    is essentually "white", without Python overhead and I am worse than I was
+    in the first place ... Issue about cache locality, that kind of things ?
+
+    Commenting stuff shows that the double k/i loop is taking all the time ...
+    while the i loops only take no measurable time ... OK, so half of the
+    time there (in the k loop) is taken by the log to lin computation, the
+    rest by the sum of product used to compute the contribution in the db
+    scale.
+
+    I can achieve SOME reduction by a reduction of the density, but this
+    method has some limits: with a density of 8 instead of 16, I am down
+    to 3.5 (instead of 5.8).
+
+
     >>> from aware import *
     >>> demo2()
     """

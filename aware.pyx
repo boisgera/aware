@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
+# cython: profile=True
 """
 Aware -- Perceptual Audio Coder
 """
@@ -20,6 +21,12 @@ from frames import split
 from psychoacoustics import ATH, bark, Mask
 from quantizers import Quantizer, ScaleFactor, Uniform
 import wave
+
+# Cython
+cimport cython
+cimport numpy as np
+cimport cpython
+from libc.math cimport log10 as math_log10
 
 #
 # Metadata
@@ -445,7 +452,14 @@ def sort_maskers(Ik, group=False):
     assert all((t_maskers == -inf) | (nt_maskers == -inf))
     return t_maskers, nt_maskers
     
-def excitation_pattern(b, b_m, I, tonal):
+
+cdef unsigned char add_excitation_pattern(
+  np.ndarray[np.float64_t, ndim=1] b, 
+  double b_m, 
+  double I, 
+  unsigned char tonal,
+  np.ndarray[np.float64_t, ndim=1] out
+):
     """
     Compute the excitation pattern of a single masker.
 
@@ -453,28 +467,32 @@ def excitation_pattern(b, b_m, I, tonal):
 
     Arguments
     --------
-      - `b`: scalar or array of frequencies in barks,
+      - `b`: array of frequencies in barks,
       - `b_m`: masker frequency (in barks),
       - `I`: masker power (in dB),
       - `tonal`: `True` if the masker is tonal, `False` otherwise.
-
-    Returns
-    -------
-
-      - `mask`: array of excitation values in dB.
-
+      - `out`: the array where the result is added (intensity values)
     """
-    db = b - b_m
-    mask  = I \
-          - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
-          - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
-          - (17.0           ) * ( db      ) * (db >=  0.0) \
-          + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
-    if tonal:
-        mask += -1.525 - 0.275 * b - 4.5
-    else:
-        mask += -1.525 - 0.175 * b - 0.5
-    return mask
+    
+    cdef unsigned int i 
+    cdef unsigned int n = len(b)
+    cdef double db
+    cdef double mask
+
+    for i in range(n):
+        db =  b[i] - b_m
+        mask = I \
+               - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
+               - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
+               - (17.0           ) * ( db      ) * (db >=  0.0) \
+               + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
+        if tonal:
+            mask += -1.525 - 0.275 * b[i] - 4.5
+        else:
+            mask += -1.525 - 0.175 * b[i] - 0.5
+        out[i] = out[i] + 10.0 ** (mask / 10.0)
+
+    return 0
 
 # TODO: use the same sampling grid than the one used for FFT ?
 # (do no distinguish b and b_k) ???. Could that help us in reducing
@@ -484,7 +502,7 @@ def excitation_pattern(b, b_m, I, tonal):
 
 _DF = 44100.0
 _SUBBANDS = 32
-_DENSITY = 16
+_DENSITY = 8
 _f = linspace(0.0, 0.5 * _DF, _SUBBANDS * (_DENSITY - 1) + 1)
 _b = bark(_f)
 _FRAME_LENGTH = 512
@@ -492,7 +510,9 @@ _f_k = arange(_FRAME_LENGTH/2 + 1) * _DF / _FRAME_LENGTH
 _b_k = bark(_f_k)
 _ATH = ATH(_f)
 
-def mask_from_frame(frame):
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef mask_from_frame(frame):
     """
     Compute the mask function for a frame.
 
@@ -508,20 +528,54 @@ def mask_from_frame(frame):
 
     """
 
+    cdef unsigned int i, k
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] mask
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] tonal
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] non_tonal
+    cdef unsigned int is_tonal
+
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] b = _b
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] b_k = _b_k
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] ATH = _ATH
+    cdef unsigned int len_b = len(b)
+    cdef unsigned int len_b_k = len(b_k)
+    
+    cdef double I
+    cdef double _mask
+    cdef double db
+    cdef double b_k_k, b_i
+
     Ik_ = Ik(frame, window=hanning)
     tonal, non_tonal = sort_maskers(Ik_, group=True)
-    
-    mask = 10.0 ** (_ATH / 10.0)
-    is_tonal = tonal > -inf
-    is_non_tonal = non_tonal > -inf
 
-    for k, b_k in enumerate(_b_k):
-        if is_tonal[k]:
-            mask += 10.0 ** (excitation_pattern(_b, b_k, tonal[k], tonal=True) / 10.0)
-        elif is_non_tonal[k]:
-            mask += 10.0 ** (excitation_pattern(_b, b_k, non_tonal[k], tonal=False) / 10.0)
+    mask = zeros(len_b)
+    for i in range(len_b):
+        mask[i] = 10.0 ** (ATH[i] / 10.0)
 
-    mask = 10.0 * log10(mask)
+    for k in range(len_b_k):
+        b_k_k = b_k[k]
+        is_tonal = (tonal[k] > - np.inf)
+        if is_tonal:
+            I = tonal[k]
+        else:
+            I = non_tonal[k] 
+        for i in range(len_b):
+            b_i = b[i]
+            db =  b_i - b_k_k
+            _mask = I \
+                    - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
+                    - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
+                    - (17.0           ) * ( db      ) * (db >=  0.0) \
+                    + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
+            if is_tonal:
+                _mask += -1.525 - 0.275 * b_i - 4.5
+            else:
+                _mask += -1.525 - 0.175 * b_i - 0.5
+            mask[i] = mask[i] + 10.0 ** (_mask / 10.0)
+
+    for i in range(len_b):
+        mask[i] = 10.0 * math_log10(mask[i])
+
     subband_mask = array(split(mask, _DENSITY, overlap=1))
     return amin(subband_mask, axis=1)
  
@@ -882,6 +936,6 @@ if __name__ == "__main__":
     # TODO: support stereo directly in demo2
     output = zeros_like(data)
     for i, channel in enumerate(data):
-        output[i,:] = demo2(channel, display=False, play=False)
+        output[i,:] = demo2(channel)
     wave.write(output, output_file)
 
