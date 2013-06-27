@@ -445,7 +445,7 @@ def sort_maskers(Ik, group=False):
     assert all((t_maskers == -inf) | (nt_maskers == -inf))
     return t_maskers, nt_maskers
     
-def excitation_pattern(f, f_m, I, tonal):
+def excitation_pattern(b, b_m, I, tonal):
     """
     Compute the excitation pattern of a single masker.
 
@@ -453,8 +453,8 @@ def excitation_pattern(f, f_m, I, tonal):
 
     Arguments
     --------
-      - `f`: scalar or array of frequencies,
-      - `f_m`: masker frequency (in Hz),
+      - `b`: scalar or array of frequencies in barks,
+      - `b_m`: masker frequency (in barks),
       - `I`: masker power (in dB),
       - `tonal`: `True` if the masker is tonal, `False` otherwise.
 
@@ -464,12 +464,6 @@ def excitation_pattern(f, f_m, I, tonal):
       - `mask`: array of excitation values in dB.
 
     """
-
-    b_m = bark(f_m)
-
-    f = array(f, copy=False)
-    b = bark(f)
-
     db = b - b_m
     mask  = I \
           - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
@@ -482,8 +476,19 @@ def excitation_pattern(f, f_m, I, tonal):
         mask += -1.525 - 0.175 * b - 0.5
     return mask
 
-        
-def mask_from_frame(frame, floor=ATH):
+# TODO: use the same sampling grid than the one used for FFT ?
+# (do no distinguish b and b_k) ???.
+_DF = 44100.0
+_SUBBANDS = 32
+_DENSITY = 16
+_f = linspace(0.0, 0.5 * _DF, _SUBBANDS * (_DENSITY - 1) + 1)
+_b = bark(_f)
+_FRAME_LENGTH = 512
+_f_k = arange(_FRAME_LENGTH/2 + 1) * _DF / _FRAME_LENGTH
+_b_k = bark(_f_k)
+_ATH = ATH(_f)
+
+def mask_from_frame(frame):
     """
     Compute the mask function for a frame.
 
@@ -492,37 +497,28 @@ def mask_from_frame(frame, floor=ATH):
 
     - `frame`: sequence of 512 samples,
 
-    - `floor`: the mask level floor in dB (defaults to `ATH`, see `psychoacoustics`),
-
     Returns
     -------
 
     - `mask`: an array of 32 subband mask level values in dB.
 
     """
-    df = 44100.0
-    subbands = 32
-    density = 16
-    f = linspace(0.0, 0.5 * df, subbands * (density - 1) + 1)
 
     Ik_ = Ik(frame, window=hanning)
     tonal, non_tonal = sort_maskers(Ik_, group=True)
-    if floor is None:
-        mask = zeros_like(f)
-    else:
-        mask = 10.0 ** (ATH(f) / 10.0)
-
+    
+    mask = 10.0 ** (_ATH / 10.0)
     is_tonal = tonal > -inf
     is_non_tonal = non_tonal > -inf
-    fk = arange(257) * 44100.0 / 512
-    for k_, fk_ in enumerate(fk):
-        if is_tonal[k_]:
-            mask += 10.0 ** (excitation_pattern(f, fk_, tonal[k_], tonal=True) / 10.0)
-        elif is_non_tonal[k_]:
-            mask += 10.0 ** (excitation_pattern(f, fk_, non_tonal[k_], tonal=False) / 10.0)
+
+    for k, b_k in enumerate(_b_k):
+        if is_tonal[k]:
+            mask += 10.0 ** (excitation_pattern(_b, b_k, tonal[k], tonal=True) / 10.0)
+        elif is_non_tonal[k]:
+            mask += 10.0 ** (excitation_pattern(_b, b_k, non_tonal[k], tonal=False) / 10.0)
 
     mask = 10.0 * log10(mask)
-    subband_mask = array(split(mask, density, overlap=1))
+    subband_mask = array(split(mask, _DENSITY, overlap=1))
     return amin(subband_mask, axis=1)
  
 
