@@ -265,6 +265,17 @@ def display_subbands(data):
 # ------------------------------------------------------------------------------
 #
 
+# Optimization TODO:
+#
+#   - rewrite a mask_from_frame reunited with sample_mask with arguments:
+#       - frame
+#       - floor
+#       - f_k ? or "df_k" ? or number of freq. sample ?
+#       - sampler that acts on the mask(f_k) ? (replaces density and algo).
+#
+#   - need also to rewrite excitation pattern to avoid the nested function.
+#     (or optional ? if not given return the function ?)
+#
 def Ik(x, window=ones, dB=True):
     """
     Compute an array of sound pressure levels / sound intensities.
@@ -434,44 +445,43 @@ def sort_maskers(Ik, group=False):
     assert all((t_maskers == -inf) | (nt_maskers == -inf))
     return t_maskers, nt_maskers
     
-def excitation_pattern(f, I, tonal=False):
+def excitation_pattern(f, f_m, I, tonal):
     """
     Compute the excitation pattern of a single masker.
 
     The spread function and attenuation factors are from MPEG-1 Audio Model 1.
 
-    Argument
+    Arguments
     --------
-
-      - `f`: masker frequency (in Hz),
+      - `f`: scalar or array of frequencies,
+      - `f_m`: masker frequency (in Hz),
       - `I`: masker power (in dB),
-      - `tonal`: wether the masker is tonal (defaults to `False`).
+      - `tonal`: `True` if the masker is tonal, `False` otherwise.
 
     Returns
     -------
 
-      - `mask`: a function of the frequency in Hz with values in dB.
+      - `mask`: array of excitation values in dB.
 
     """
 
+    b_m = bark(f_m)
+
+    f = array(f, copy=False)
     b = bark(f)
 
-    def mask(f_):
-        f_ = array(f_, copy=False)
-        b_ = bark(f_)
-        db = b_ - b
-        mask_  = I 
-        mask_ += -(11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0)
-        mask_ += -( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0)
-        mask_ += -(17.0           ) * ( db      ) * (db >=  0.0)
-        mask_ +=  (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
-        if tonal:
-            mask_ += -1.525 - 0.275 * b_ - 4.5
-        else:
-            mask_ += -1.525 - 0.175 * b - 0.5
-        return mask_ 
-
+    db = b - b_m
+    mask  = I \
+          - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
+          - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
+          - (17.0           ) * ( db      ) * (db >=  0.0) \
+          + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
+    if tonal:
+        mask += -1.525 - 0.275 * b - 4.5
+    else:
+        mask += -1.525 - 0.175 * b - 0.5
     return mask
+
         
 def mask_from_frame(frame, floor=ATH):
     """
@@ -480,66 +490,75 @@ def mask_from_frame(frame, floor=ATH):
     Arguments
     ---------
 
-    - `frame`: a sequence of 512 numbers,
+    - `frame`: sequence of 512 samples,
 
-    - `floor`: the mask level floor (default to `ATH`, see `psychoacoustics`).
+    - `floor`: the mask level floor in dB (defaults to `ATH`, see `psychoacoustics`),
 
     Returns
     -------
 
-    - `mask`: a function with a frequency argument in Hz and mask level values
-      in dB.
+    - `mask`: an array of 32 subband mask level values in dB.
+
     """
+    df = 44100.0
+    subbands = 32
+    density = 16
+    f = linspace(0.0, 0.5 * df, subbands * (density - 1) + 1)
+
     Ik_ = Ik(frame, window=hanning)
     tonal, non_tonal = sort_maskers(Ik_, group=True)
     if floor is None:
-        mask = Mask()
+        mask = zeros_like(f)
     else:
-        mask = Mask(ATH)
+        mask = 10.0 ** (ATH(f) / 10.0)
 
     is_tonal = tonal > -inf
     is_non_tonal = non_tonal > -inf
     fk = arange(257) * 44100.0 / 512
     for k_, fk_ in enumerate(fk):
         if is_tonal[k_]:
-            mask += excitation_pattern(fk_, tonal[k_], tonal=True)
+            mask += 10.0 ** (excitation_pattern(f, fk_, tonal[k_], tonal=True) / 10.0)
         elif is_non_tonal[k_]:
-            mask += excitation_pattern(fk_, non_tonal[k_], tonal=False)
-    return mask
+            mask += 10.0 ** (excitation_pattern(f, fk_, non_tonal[k_], tonal=False) / 10.0)
 
-def sample_mask(mask, subbands=32, density=16, algo=amin):
-    """
-    Compute an array of mask levels in regularly spaced subbands.
+    mask = 10.0 * log10(mask)
+    subband_mask = array(split(mask, density, overlap=1))
+    return amin(subband_mask, axis=1)
+ 
 
-    Arguments
-    ---------
+#def sample_mask(mask, subbands=32, density=16, algo=amin):
+#    """
+#    Compute an array of mask levels in regularly spaced subbands.
 
-    - `mask`: a mask function (see `mask_from_frame`),
+#    Arguments
+#    ---------
 
-    - `subbands`: the number of subbands,
+#    - `mask`: a mask function (see `mask_from_frame`),
 
-    - `density`: the number of mask values computed per subband,
+#    - `subbands`: the number of subbands,
 
-    - `algo`: determines how the sequence of mask values for a subband 
-      generates a single subband mask value. By default,
-      the lowest value is picked (worst-case mask).
+#    - `density`: the number of mask values computed per subband,
 
-    Returns
-    -------
+#    - `algo`: determines how the sequence of mask values for a subband 
+#      generates a single subband mask value. By default,
+#      the lowest value is picked (worst-case mask).
 
-    - `levels`: a sequence of `subbands` mask levels.
+#    Returns
+#    -------
+
+#    - `levels`: a sequence of `subbands` mask levels.
 
 
-    Example
-    -------
+#    Example
+#    -------
 
-        >>> mask = lambda f: 96.0 * (f / 22050.0)
-        >>> list(sample_mask(mask, subbands=4))
-        [0.0, 24.0, 48.0, 72.0]
-    """
-    f = linspace(0.0, 0.5 * 44100.0, subbands * (density - 1) + 1)
-    mask_ = array(split(mask(f), density, overlap=1))
-    return algo(mask_, axis=1)
+#        >>> mask = lambda f: 96.0 * (f / 22050.0)
+#        >>> list(sample_mask(mask, subbands=4))
+#        [0.0, 24.0, 48.0, 72.0]
+#    """
+#    f = linspace(0.0, 0.5 * 44100.0, subbands * (density - 1) + 1)
+#    mask_ = array(split(mask(f), density, overlap=1))
+#    return algo(mask_, axis=1)
 
 def display_mask(frame=None, interactive=True):
     """
@@ -629,7 +648,7 @@ def allocate_bits(frames, mask, bit_pool=_bit_pool):
     assert sum(bits) == bit_pool # check that all bits have been allocated
     return array(bits)
 
-# TODO: transfer to quanizers ?
+# TODO: transfer to quanizers ? Too specific for that ? Transfer a part of it ?
 class SubbandQuantizer(Quantizer):
     def __init__(self, mask=None, bit_pool=_bit_pool):
         self.mask = mask
@@ -673,7 +692,7 @@ class SubbandQuantizer(Quantizer):
 # ------------------------------------------------------------------------------
 #
 
-def demo(data=None, bit_pool=_bit_pool, play=True, display=True):
+def demo(data=None, bit_pool=_bit_pool, play=False, display=False):
     if data is None:
         data = square(1760.0, 512*100)
 
@@ -682,7 +701,7 @@ def demo(data=None, bit_pool=_bit_pool, play=True, display=True):
     # Compute the single mask used for every bit allocation.
     reference_frame = data[:512]
     length = len(data)
-    mask = sample_mask(mask_from_frame(reference_frame), 32)
+    mask = mask_from_frame(reference_frame)
 
     if display:
         figure()
@@ -753,6 +772,9 @@ def demo(data=None, bit_pool=_bit_pool, play=True, display=True):
         time.sleep(1.0)
         sh.play("tmp/sound-aware.wav")
 
+    return output
+
+
 def demo2(data=None, report=False):
     if data is None:
         data = square(1760.0, 512*100)
@@ -793,7 +815,7 @@ def demo2(data=None, report=False):
     # TODO: interleave the mask computation / bit allocation ? for frame-by
     #       frame computation ?
     mask_frames = split(r_[zeros(351), data], 512, zero_pad=True, overlap=128) 
-    masks = [sample_mask(mask_from_frame(frame), 32) for frame in mask_frames]
+    masks = [mask_from_frame(frame) for frame in mask_frames]
     extra["mask"] = masks
 
     # Apply the analysis filter bank.
