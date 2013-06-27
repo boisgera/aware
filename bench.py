@@ -20,6 +20,17 @@ def demo2():
     real-time). Now excitation_pattern is taking 50% of the time (self) and
     mask_from_frame 25%.
 
+    The bottleneck now is excitation_pattern, called too many times. At this
+    stage, I feel that there are two options:
+
+      - vectorize excitation_patterns to avoid the loop in mask_from_frame:
+        that way we may reduce the number of calls by 257, which may be
+        enough.
+
+      - go Cython in excitation_pattern to reduce the cost of a function call
+        and do the same in the loop of mask_from_frame and maybe in the demo2
+        calling loop. That's *probably* more efficient ...
+
     >>> from aware import *
     >>> demo2()
     """
