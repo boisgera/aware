@@ -520,13 +520,13 @@ class SubbandQuantizer(Quantizer):
     def __init__(self, mask, bit_pool=None):
         self.mask = mask
         self.bit_pool = bit_pool or BIT_POOL
-        self._bits = []
+        self.bits = []
 
     def encode(self, frames):
         frames = np.array(frames)
         assert np.shape(frames) == (12, 32)
         bits = allocate_bits(frames, self.mask, bit_pool=self.bit_pool)
-        self._bits.append(bits)
+        self.bits.append(bits)
         quantizers = []
         for i, bit in enumerate(bits):
             N = 2**bit - 1
@@ -642,22 +642,13 @@ class SubbandQuantizer(Quantizer):
 #    return output
 # ..............................................................................
 
-# TODO: investigate a initial 31-sample zero padding instead of computing the
-#       delay induced by the filter. Does it simplify the implementation ?
-#       The resulting delay at the analysis is 256, that means that we only
-#       have to trash the first batch of 8x32 subband values before we start
-#       the subband quantization. So I guess that the answer is yes, that's
-#       simpler.
 
-def demo(data=None, log=False):
-    if data is None:
-        data = square(1760.0, 44100)
-    t = arange(len(data)) * dt
-    length = len(t)
-    assert length >= 1024
-
-    if log:
-        log = {"bits": [], "mask": []}
+# TODO: instead of the log approach, develop a "locals capture" aka snapshot ?
+#       such that ALL relevant variables are captured but there is no change
+#       is the pattern that is returned ? Capture only the variables that 
+#       are listed as keys in snapshot ?
+def demo(data, snapshot=None):
+    data = np.array(data)
 
     # Synchronisation
     # --------------------------------------------------------------------------
@@ -691,87 +682,54 @@ def demo(data=None, log=False):
     #     frame of N samples and to used the data length of the binary format 
     #     to stop at the right point.
 
-    # The delay computation to get the spectral analysis and the frame 
-    # compression right has to be done carefully:
-    # 
-    #   - the "polyphase implementation hack" that avoids to compute an initial
-    #     almost empty frame. It corresponds to an *advance* of M - 1 samples.
-    #
-    #   - the way the analysis filter is implemented (N-sample impulse response
-    #     with N even and a leading 0 added for parity) induces an extra 256 
-    #     delay
-    #
-    # This sums up to 225 delay. 
-    #
-    # WHOOT ? That should be 256 - 31, not +31, right ??? So 225
+    # TODO: add some sync. info, in order to be able, given a sample number
+    #       of the *original* signal, to get the appropriate mask, bit alloc.
+    #       pattern, etc. Use that information for example to display the
+    #       chunk of L samples that are handled together ?
 
-    analysis_delay  = - (M - 1) + N // 2
-    synthesis_delay = N // 2
-    total_delay = analysis_delay + synthesis_delay
-
-    # Make sure that to "push" all the relevant values from the analysis and
-    # synthesis registers by feeding extra zeros at the end of the signal.
-    # As the total delay is 481, a frame of 512 is fine.
-    data = r_[data, np.zeros(N)]
-    
-    # Compute the masks to use for bit allocation.
-    # --------------------------------------------------------------------------
-    # The masks are based on 512-sample FFT while the bit allocation applies
-    # on 12 x 32 = 384 samples so there is an overlap between the data used
-    # by the FFT of 128 samples, 64 before and 64 after the 'real' data.
-    # This is used in conjunction with Hanning window, so this actually make
-    # sense.
-    # To perform the spectral analysis, we could
-    # create a buffer with 225 + 64 = 289 zeros in front of the real data,
-    # then perform the first mask computation at the buffer start and shift
-    # by 384 until the end of the signal is obtained.
-    #
-    
-    # TODO: interleave the mask computation / bit allocation ? for frame-by
-    #       frame computation ? 
-    mask_frames = split(r_[zeros(analysis_delay + (N - L) // 2), data], 
-                        N, zero_pad=True, overlap=(N - L)) 
+    # Compute the masks
+    overlap = N_FFT - L
+    head = np.zeros(N // 2 + overlap // 2)
+    tail = np.zeros(N + L + overlap // 2) # covers the worst-case
+    data_mask_sync = np.r_[head, data, tail]
+    mask_frames = split(data_mask_sync, N_FFT, zero_pad=True, overlap=(N - L)) 
     masks = [mask_from_frame(frame) for frame in mask_frames]
-    if log:
-        log["mask"] = masks
 
     # Apply the analysis filter bank.
+    head = np.zeros(M-1)
+    tail = np.zeros(N)
+    data_filter_sync = np.r_[head, data, tail]
+    # enforce a data length that is a multiple of L
+    extra_tail = np.zeros((L - len(data_filter_sync) % L) % L)
+    data_filter_sync = np.r_[data_filter_sync, extra_tail]
     analyze = Analyzer(MPEG.A, dt=MPEG.dt)
-    frames = array(split(data, MPEG.M, zero_pad=True))
+    frames = np.array(split(data_filter_sync, MPEG.M, zero_pad=True))
     subband_frames = array([analyze(frame) for frame in frames])
 
-    # Make sure we have an entire numbers of 12-sample frames.
-    remainder = shape(subband_frames)[0] % (L / M)
-    if remainder:
-        subband_frames = r_[subband_frames, zeros((L / M - remainder, M))]
-
-    # Quantize the data in each subband.
+    # Quantize the subband data
     quant_subband_frames = []
-    #mean_bits = []
-    for i in range(shape(subband_frames)[0] / (L / M)):
+    bits = []
+    assert shape(subband_frames)[0] % (L // M) == 0
+    num_blocks = shape(subband_frames)[0] // (L // M)
+    for i in range(num_blocks):
         subband_quantizer = SubbandQuantizer(masks[i])
-        subband_frame = subband_frames[i*(L / M):(i+1)*(L / M)]
+        subband_frame = subband_frames[i*(L // M) : (i+1)*(L // M)]
         quant_subband_frames.append(subband_quantizer(subband_frame))
-        #mean_bits.append(subband_quantizer.mean_bit_alloc())
-        if log:
-            log["bits"].extend(subband_quantizer._bits)
+        bits.extend(subband_quantizer.bits)
+    bits = np.array(bits)
 
-    # Reconstruct the approximation of the original audio data 
+    # Reconstruct the (approximation of) the original audio data 
     synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
     output = []
-    for frame_12 in quant_subband_frames:
-        for frame in frame_12:
+    for frames in quant_subband_frames:
+        for frame in frames:
             output.extend(synthesize(frame))
+    output = output[N:N+len(data)]
 
-    # Synchronize input and output data.
-    data = data[:length]
-    output = output[total_delay:length+total_delay]
+    if snapshot is not None:
+        snapshot.update(locals())
 
-    if log:
-        log["bits"] = array(log["bits"])
-        return output, log
-    else:
-        return output
+    return output
 
 # 
 # Unit Test Runner
@@ -797,7 +755,7 @@ def test():
 
 
 if __name__ == "__main__":
-    demo(log=True)
+    demo()
 
 if __name__ == "__main____":
     # TODO: get the extra analysis data and save it in another file ? Y.
