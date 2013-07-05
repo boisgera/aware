@@ -5,6 +5,7 @@ Aware -- Perceptual Audio Coder
 """
 
 # Python 2.7 Standard Library
+from __future__ import division
 import doctest
 import pickle
 import sys
@@ -12,12 +13,15 @@ import time
 
 # Third-Party Libraries
 import sh
+import numpy as np
+import pylab as pl
 from pylab import *; seterr(all="ignore")
 
 # Digital Audio Coding
-from filters import MPEG
+from filters import MPEG, Analyzer, Synthesizer
 from frames import split
-from psychoacoustics import ATH, bark, Mask
+import psychoacoustics
+from psychoacoustics import ATH, bark, hertz, Mask
 from quantizers import Quantizer, ScaleFactor, Uniform
 import wave
 
@@ -30,25 +34,32 @@ __license__ = "MIT License"
 __version__ = None
 
 #
-# TODO
-# ------------------------------------------------------------------------------
-#
-# Make a `demo` that can manage signals with time-varying masks.
-#
-#   - the psychoacoustics "Mask" abstraction is costly and should probably not 
-#     be used here. Still, if I take into account only the mask computation, 
-#     the perceptual coder could run at approximately 1/2 - 1/3 real-time.
-#
-
-
-#
 # Constants
 # ------------------------------------------------------------------------------
 #
 
-N = 512
+# sampling frequency / time
 df = 44100.0
 dt = 1.0 / df
+
+# fft window size
+N_FFT = 512
+
+# filter length (FIR)
+N = MPEG.N
+
+# number of subbands
+M = MPEG.M
+
+# frame size for the subband quantizer
+L = 12 * M
+
+# number of bits available for every sequence of M subband samples
+BIT_POOL = 112
+assert 2 <= BIT_POOL <= M * 16
+
+# scale factor used by the subband quantizer 
+SCALE_FACTORS = logspace(1, -20, 64, base=2.0)[::-1] 
 
 #
 # Signal Generators
@@ -65,386 +76,173 @@ def white_noise(sigma=1.0, N=512):
 def square(f=440.0, N=512):
     n = int(round_(0.5 * (df / f)))
     period = reshape(r_[ones(n), -1.0 * ones(n)], (1, 2*n))
-    return ravel(repeat(period, N /(2*n) + 1, axis=0))[:N]
+    return ravel(repeat(period, N //(2*n) + 1, axis=0))[:N]
    
+#
+# Helpers
+# ------------------------------------------------------------------------------
+#
+
+pass
+
 #
 # Analysis and Synthesis Filter Banks
 # ------------------------------------------------------------------------------
 #
 
-class Analyzer(object):
-    """
-    Analysis Filter Bank
-
-    Compute the output of an array of causal FIR filters, critically sampled.
-
-    Attributes
-    ----------
-    
-    - `M`: number of subbands,
-
-    - `N`: common filter length.
-
-    Example
-    -------
-
-    We define an analysis filter bank with filters numbered from 0 to 3. 
-    The i-th filter is a simple delay of i + 4 samples. 
-    The common filter length is set to 8 (the minimal requirement).
-    
-        >>> Z = zeros((4, 4), dtype=float)
-        >>> I = eye(4, dtype=float)
-        >>> a = c_[Z, I]
-
-        >>> analyzer = Analyzer(a)
-        >>> analyzer.M, analyzer.N
-        (4, 8)
-        >>> analyzer([1, 2, 3, 4])
-        array([ 0.,  0.,  0.,  0.])
-        >>> analyzer([5, 6, 7, 8])
-        array([ 4.,  3.,  2.,  1.])
-        >>> analyzer([0, 0, 0, 0])
-        array([ 8.,  7.,  6.,  5.])
-        >>> analyzer([0, 0, 0, 0])
-        array([ 0.,  0.,  0.,  0.])
-    """
-    def __init__(self, a, dt=1.0, gain=1.0):
-        """
-        Arguments:
-        ----------
-
-          - `a`: filter bank impulse responses -- a two-dimensional numpy array 
-            whose row `a[i,:]` is the impulse response of the `i`-th bank 
-            filter.
-
-          - `dt`: sampling time, defaults to `1.0`,
-
-          - `gain`: a factor applied to the output values, defaults to `1.0`.
-        """
-        self.M, self.N = shape(a)
-        self.A = gain * a * dt
-        self.buffer = zeros(self.N)
-
-    def __call__(self, frame):
-        """
-        Argument
-        --------
-
-        - `frame`: a sequence of `self.M` new input value of the filter bank, 
-        
-        Returns
-        -------
-
-        - `subbands`: the corresponding `self.M` new output subband values.
-        """
-        frame = array(frame, copy=False)
-        if shape(frame) != (self.M,):
-            raise ValueError("shape(frame) is not ({0},)".format(self.M))
-        self.buffer[self.M:] = self.buffer[:-self.M]
-        self.buffer[:self.M] = frame[::-1]
-        return dot(self.A, self.buffer)
-
-class Synthesizer(object):
-    """
-    Synthesis Filter Bank
-
-    Combine critically sampled subband signals with an array of causal 
-    FIR filters.
-
-    Attributes
-    ----------
-    
-    - `M`: number of subbands,
-
-    - `N`: common filter length.
-
-    Example
-    -------
-
-    We define a synthesis filter bank with filters numbered from 0 to 3. 
-    The i-th filter is a simple delay of 7 - i samples. This synthesis
-    filter bank provides a perfect reconstruction for the analysis filter
-    bank implemented in the section "example" of the `Analyzer` 
-    documentation, with a combined delay of 2 frames (8 samples).
-
-
-        >>> Z = zeros((4, 4), dtype=float)
-        >>> J = eye(4, dtype=float)[:,::-1]
-        >>> a = c_[Z, J]
-
-        >>> synthesizer = Synthesizer(a)
-        >>> synthesizer.M, synthesizer.N
-        (4, 8)
-        >>> synthesizer([0, 0, 0, 0])
-        array([ 0.,  0.,  0.,  0.])
-        >>> synthesizer([4, 3, 2, 1])
-        array([ 0.,  0.,  0.,  0.])
-        >>> synthesizer([8, 7, 6, 5])
-        array([ 1.,  2.,  3.,  4.])
-        >>> synthesizer([0, 0, 0, 0])
-        array([ 5.,  6.,  7.,  8.])
-        >>> synthesizer([0, 0, 0, 0])
-        array([ 0.,  0.,  0.,  0.])
-    """
-    def __init__(self, s, dt=1.0, gain=1.0):
-        """
-        Arguments:
-        ----------
-
-          - `s`: filter bank impulse responses -- a two-dimensional numpy array 
-            whose row `s[i,:]` is the impulse response of the `i`-th bank 
-            filter.
-
-          - `dt`: sampling time, defaults to 1.0,
-
-          - `gain`: a factor applied to the output values, defaults to `1.0`.
-        """
-        self.M, self.N = shape(s)
-        self.P = transpose(gain * dt * s)[::-1,:]
-        self.buffer = zeros(self.N)
-
-    def __call__(self, frame):
-        """
-        Argument
-        --------
-
-        - `subbands`: a sequence of `self.M` new subband values, 
-        
-        Returns
-        -------
-
-        - `frame`: the corresponding `self.M` new output values.
-
-        """
-        frame = array(frame, copy=False)
-        if shape(frame) != (self.M,):
-            raise ValueError("shape(frame) is not ({0},)".format(self.M))
-        self.buffer += dot(self.P, frame)
-        output = self.buffer[-self.M:][::-1].copy()
-        self.buffer[self.M:] = self.buffer[:-self.M]
-        self.buffer[:self.M] = zeros(self.M)
-        return output
-
-_delay = 481
-
-def reconstruct(data, shift_delay=True):
-    """
-    MPEG Pseudo-Quadrature Mirror Filters
-    """
-    analyze = Analyzer(MPEG.A, dt=MPEG.dt)
-    synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
-    length = len(data)
-    data = r_[data, zeros(512)] # take into account the delay:
-    # without this extra frame, we may not have enough output values.
-    frames = array(split(data, MPEG.M, zero_pad=True))
-
-    output = []
-    for frame in frames:
-        output.extend(synthesize(analyze(frame)))
-    output = array(output)
-
-    if shift_delay:
-        output = output[_delay:_delay+length]
-    return output
-
 def display_subbands(data):
     analyze = Analyzer(MPEG.A, dt=MPEG.dt)
-    data = r_[data, zeros(512)] # take into account the delay:
-    frames = array(split(data, MPEG.M, zero_pad=True))
+    # Add zeros at the head to implement strictly the polyphase filter
+    # and add zeros at the tail to account for the filter-induced delay.
+    data = r_[np.zeros(M-1), data, np.zeros(N)]
+    frames = np.array(split(data, MPEG.M, zero_pad=True))
     subband_frames = transpose([analyze(frame) for frame in frames])
-    assert shape(subband_frames)[0] == 32
+    assert shape(subband_frames)[0] == M
     for i, data in enumerate(subband_frames):
-        plot(data + i*1.0, "k-")
-    title("Subband Decomposition")
-    ylabel("subband number")
-    xlabel("subband data")
-    axis("tight")
+        pl.plot(data + i*1.0, "k-")
+    pl.title("Subband Decomposition")
+    pl.ylabel("subband number")
+    pl.xlabel("subband data")
+    pl.axis("tight")
+
 
 #
-# Psychoacoustics Masks
+# Perceptual Model
 # ------------------------------------------------------------------------------
 #
 
-# Optimization TODO:
-#
-#   - rewrite a mask_from_frame reunited with sample_mask with arguments:
-#       - frame
-#       - floor
-#       - f_k ? or "df_k" ? or number of freq. sample ?
-#       - sampler that acts on the mask(f_k) ? (replaces density and algo).
-#
-#   - need also to rewrite excitation pattern to avoid the nested function.
-#     (or optional ? if not given return the function ?)
-#
-def Ik(x, window=ones, dB=True):
-    """
-    Compute an array of sound pressure levels / sound intensities.
-    
-    The `k`-th component of `Ik(x)` corresponds to the contribution of the
-    frequency `fk = k * df / len(x)` where `df` is the sampling frequency. 
-    The index `k` ranges from `0` to the largest value such that 
-    `fk <= 0.5 * df` (the Nyquist frequency).
-    
-    
-    Arguments
-    ---------
-
-      - `x`: a sequence of numbers, the signal to be analyzed.
-
-      - `window`: an optional window function (no window by default). 
-
-        The window is automatically multiplied by a gain that attempts to
-        compensates the energy loss caused by the signal windowing (this
-        gain depends only on the window, not on the signal values).
-
-      - `dB`: compute the intensities as SPL in dB (defaults to `True`).
-
-
-    Returns
-    -------
-
-      - `Ik`: an array of length `len(x) / 2 + 1`.
-
-
-    Examples
-    --------
-
-        >>> x = ones(32, dtype=float)
-        >>> P = mean(x**2)
-        >>> P == sum(Ik(x, dB=False))
-        True
-
-        >>> x = ones(32, dtype=float)
-        >>> Ik_ = Ik(x)
-        >>> len(Ik_) == len(x) / 2 + 1
-        True
-        >>> k = arange(len(Ik_))
-        >>> df = 1.0
-        >>> all([k_ * df / len(x) <= df / 2.0 for k_ in k])
-        True
-        >>> (k[-1] + 1) * df / len(x) <= df / 2.0
-        False
-    """
-    x = array(x, copy=False)
-    if len(shape(x)) != 1:
-        raise TypeError("the frame should be 1-dimensional.")
-    n = len(x)
+def raw_maskers(frame, window=hanning):
+    frame = array(frame, copy=False)
+    if shape(frame) != (N,):
+        error = "the frame should be 1-dim. with {0} samples."
+        raise TypeError(error.format(N))
 
     # Compute a gain alpha that compensates the energy loss caused by the 
     # windowing -- a frame with constant values is used as a reference.
-    alpha = 1.0 / sqrt(sum(window(n)**2) / n)
-    x = alpha * window(n) * x
+    alpha = 1.0 / sqrt(sum(window(N)**2) / N)
+    x = alpha * window(N) * frame
 
-    xk2 = abs(fft(x)) ** 2
-    half_n = n / 2 + 1 # 3 -> 2, 4 -> 3, 5 -> 3, 6 -> 4, etc.
-    Ik = 2.0 * xk2[:half_n] / n ** 2
-    Ik[0] = 0.5 * Ik[0]
-    if (n % 2 == 0):
-        Ik[-1] = 0.5 * Ik[-1]
-    if dB:
-        Ik = 10.0 * log10(Ik) + 96.0          
-    return Ik
+    k = arange(N // 2 + 1)
+    frame_fft_2 = abs(fft(frame)) ** 2
 
-def display_Ik(x):
-    """
-    Display the power spectrum of the frame `x`
-    """
-    fk = arange(len(x)/2 + 1) * df / len(x)
-    plot(fk, Ik(x), "k-", label="rect. window")
-    plot(fk, Ik(x, window=hanning), "b", label="hanning window")
-    grid(True)
-    xlabel("frequency $f$ [Hz]")
-    ylabel("intensity [dB]")
-    title("Power Spectrum")
-    axis("tight")
-    legend()
+    P = 2.0 * frame_fft_2[:(N // 2 + 1)] / N ** 2
+    P[0] = 0.5 * P[0]
+    if (N % 2 == 0):
+        P[-1] = 0.5 * P[-1]
 
-def sort_maskers(Ik, group=False):
-    """
-    Sort maskers into tonal and non-tonal masker components.
-
-    Argument
-    --------
-
-      - `Ik`: a sequence of 257 masker levels in dB,
-
-      - `group`: whether close tonal components should be grouped
-        (defaults to `False`)
-
-    Returns
-    -------
-
-      - `tonal`, `non_tonal`: two sequences of 257 masker levels in dB.
-
-        The sequence `tonal` represents the tonal masker levels, 
-        `non_tonal` to non-tonal masker levels.
-
-    Example 
-    -------
-
-    Consider a `maskers` array made of a floor at 0 dB and of a localized
-    masker with a level of 96 dB:
-
-        >>> maskers = zeros(257)
-        >>> maskers[128] = 96.0
-
-        >>> tonal, non_tonal = sort_maskers(maskers)
-
-    The localized masker and its neighbours are selected and added in `tonal`:
-
-        >>> list(tonal[125:132])
-        [-inf, -inf, 0.0, 96.0, 0.0, -inf, -inf]
-
-    The corresponding values are removed from `non_tonal`:
-
-        >>> list(non_tonal[125:132])
-        [0.0, 0.0, -inf, -inf, -inf, 0.0, 0.0]
-
-    Same setting but with a masker localized on 3 spectral indices with the same 
-    total 96 dB level and where we group the tonal neighbours:
-
-        >>> level = 10.0 * log10((10.0 **(96.0 / 10.0)) / 3.0)
-        >>> level # doctest: +ELLIPSIS
-        91.2...
-        >>> maskers = zeros(257)
-        >>> maskers[127:130] = level
-        >>> list(maskers[125:132]) # doctest: +ELLIPSIS
-        [0.0, 0.0, 91.2..., 91.2..., 91.2..., 0.0, 0.0]
-
-        >>> tonal, non_tonal = sort_maskers(maskers, group=True)
-        >>> list(tonal[125:132]) # doctest: +ELLIPSIS
-        [-inf, -inf, -inf, 96.0..., -inf, -inf, -inf]
-        >>> list(non_tonal[125:132])
-        [0.0, 0.0, -inf, -inf, -inf, 0.0, 0.0]
-
-    """
-
-    Ik = array(Ik, copy=False)
-    if shape(Ik) != (257,):
-        raise ValueError("invalid argument shape, it should be (257,)")
-    t_maskers  = - inf * ones(len(Ik))
-    nt_maskers = Ik.copy()
-    for k, _ in enumerate(Ik): 
-        if k <= 2 or k > 250:
-            continue
-        elif 2 < k < 63:
-            js = [-2, +2]
-        elif 63 <= k < 127:
-            js = [-3, -2, +2, +3]
-        elif 127 <= k <= 250:
-            js = [-6, -5, -4, -3, -2, +2, +3, +4, +5, +6]
-
-        if Ik[k] >= Ik[k-1] and Ik[k] >= Ik[k+1] \
-           and all([Ik[k] >= Ik[k+j] + 7.0 for j in js]):
-           if group:
-               t_maskers[k] = 10 * log10(10**(Ik[k-1]/10) + 10**(Ik[k]/10) + 10**(Ik[k+1]/10))
-           else:   
-               t_maskers[k-1:k+2] = Ik[k-1:k+2]
-           nt_maskers[k-1] = nt_maskers[k] = nt_maskers[k+1] = -inf 
-
-    assert all((t_maskers == -inf) | (nt_maskers == -inf))
-    return t_maskers, nt_maskers
+    # +96 dB normalization
+    P = 10.0 ** (96.0 / 10.0) * P
     
+    return k, P
+
+class Classifier(object):
+    "Tone/Noise Classifier"
+    def __init__(self):
+        small  = np.array([-2, +2])
+        medium = np.array([-3, -2, +2, +3]) 
+        large  = np.array([-6, -5, -4, -3, -2, +2, +3, +4, +5, +6])
+        self.neighbourhood = 256 * [None]
+        for _k in range(2, 63):
+            self.neighbourhood[_k] = small
+        for _k in range(63, 127):
+            self.neighbourhood[_k] = medium
+        for _k in range(127, 251):
+            self.neighbourhood[_k] = large        
+    def __call__(self, k, P):
+        assert all(k == np.arange(0, N // 2 + 1))
+        k_t = []
+        P_t = []
+        for _k in arange(3, 251):
+            if (P[_k-1] <= P[_k] and P[_k+1] <= P[_k]): # local maximum
+                js = self.neighbourhood[_k]
+                if all(P[_k] >= 5.0 * P[_k+js]): # +7.0 dB
+                    k_t.append(_k)
+                    P_t.append(P[_k-1] + P[_k] + P[_k+1])
+                    P[_k-1] = P[_k] = P[_k+1] = 0.0
+        return (array(k_t), array(P_t)), (k, P)        
+
+classify = Classifier()
+
+def group_by_critical_band(k, P):
+    # cb_k: critical band number indexed by frequency line index k.
+    f_k = arange(N // 2 + 1) * df / N
+    b_k = bark(f_k)
+    cb_k = array([int(b) for b in floor(b_k)])
+    bands = [[] for _ in arange(amax(cb_k) + 1)]
+    for _k, _P in zip(k, P):
+        bands[cb_k[_k]].append((_k, _P))
+    return bands
+
+# rename "merge_tonals" (optimization "T" for tone)
+# rk: that's not exactly what I've read about: this is not a cb by cb matter
+#     but a merge if the distance between 2 k's is < 0.5 bark.
+# 
+# TODO: replace the entire k by (floating-point) f_k ? Would induce less
+#       error in the mask computations at low-freq.
+def merge_tonals(k_t, P_t):
+    bands = group_by_critical_band(k_t, P_t)
+    k_t_out, P_t_out = [], []
+    for band, k_P_s in enumerate(bands):
+        if k_P_s:
+            k_max = None
+            P_max = - inf 
+            for (_k, _P) in k_P_s:
+               if _P > P_max:
+                   k_max = _k
+                   P_max = _P
+            k_t_out.append(k_max)
+            P_t_out.append(P_max)
+    return array(k_t_out), array(P_t_out)
+
+
+# (optimization "N" noise)
+def merge_non_tonals(k_nt, P_nt):
+    bands = group_by_critical_band(k_nt, P_nt)
+    k_nt_out = zeros(len(bands), dtype=uint8)
+    P_nt_out = zeros(len(bands))
+    for band, k_P_s in enumerate(bands):
+        if k_P_s:
+            k_P_array = array(k_P_s)
+            k = k_P_array[:,0]
+            P = k_P_array[:,1]
+            P_sum = sum(P)
+            # k_mean: not sure that's the best thing to do.
+            # geometric mean suggested by Rosi. I believe that an 
+            # arithmetic mean in the bark scale is better yet.
+            if all(P == 0.0):
+                P = ones_like(P)
+            k_mean = int(round(average(k, weights=P))) 
+            #bark_mean = mean([bark(k[i] * df / N) for i in arange(len(k)) 
+            #                  if P[i]>0])            
+            #k_mean = int(round(hertz(bark_mean) * N / df))
+            #print "k, k_mean:", k, k_mean
+            k_nt_out[band] = k_mean
+            P_nt_out[band] = P_sum
+    return k_nt_out, P_nt_out
+
+# "T" for threshold ? "A" for absolute ?
+def threshold(k, P):
+    f_k = arange(N // 2 + 1) * df / N
+    ATH_k = 10 ** (ATH(f_k) / 10.0)
+    k_out, P_out = [], []
+    for (_k, _P) in zip(k, P):
+        if _P > ATH_k[_k]:
+            k_out.append(_k)
+            P_out.append(_P)
+    return array(k_out), array(P_out)
+
+def maskers(frame):
+    k, P = raw_maskers(frame)
+    (k_t, P_t), (k_nt, P_nt) = classify(k, P)
+    k_t, P_t = merge_tonals(k_t, P_t)
+    k_nt, P_nt = merge_non_tonals(k_nt, P_nt)
+    k_t, P_t = threshold(k_t, P_t)
+    k_nt, P_nt = threshold(k_nt, P_nt)
+    return (k_t, P_t), (k_nt, P_nt)
+
+
+#-------------------------------------------------------------------------------
+
 def excitation_pattern(b, b_m, I, tonal):
     """
     Compute the excitation pattern of a single masker.
@@ -465,32 +263,41 @@ def excitation_pattern(b, b_m, I, tonal):
 
     """
     db = b - b_m
+
+    db_1 = np.minimum(db + 1.0, 0.0)
+    db_2 = np.minimum(db      , 0.0)
+    db_3 = np.maximum(db      , 0.0)
+    db_4 = np.maximum(db - 1.0, 0.0)    
+
     mask  = I \
-          - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
-          - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
-          - (17.0           ) * ( db      ) * (db >=  0.0) \
-          + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
+          + (11.0 - 0.40 * I) * db_1 \
+          + ( 6.0 + 0.40 * I) * db_2 \
+          - (17.0           ) * db_3 \
+          + (       0.15 * I) * db_4
+
+#    mask  = I \
+#          - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
+#          - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
+#          - (17.0           ) * ( db      ) * (db >=  0.0) \
+#          + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
     if tonal:
         mask += -1.525 - 0.275 * b - 4.5
     else:
         mask += -1.525 - 0.175 * b - 0.5
     return mask
 
-# TODO: use the same sampling grid than the one used for FFT ?
-# (do no distinguish b and b_k) ???. Could that help us in reducing
-# the number of calls to excitation_pattern (30000 for 1 sec) ?
-# Not really, these are different issues. (that could be done to
-# simplify the code, but not optimize it).
+# TODO: Avoid globals here, create a closure or a class, stop polluting
+#       the global namespace.
+# k is the frequency line index (257 values), i a subsampling (112 values).
+k = arange(N // 2 + 1)
+f_k = k * df / N
+b_k = bark(f_k)
 
-_DF = 44100.0
-_SUBBANDS = 32
-_DENSITY = 16
-_f = linspace(0.0, 0.5 * _DF, _SUBBANDS * (_DENSITY - 1) + 1)
-_b = bark(_f)
-_FRAME_LENGTH = 512
-_f_k = arange(_FRAME_LENGTH/2 + 1) * _DF / _FRAME_LENGTH
-_b_k = bark(_f_k)
-_ATH = ATH(_f)
+k_i = r_[0:49, 49:97:2, 97:251:4]
+f_i = k_i * df / N
+b_i = bark(f_i)
+ATH_i = ATH(f_i)
+subband_i = array([int(s) for s in floor(f_i / (0.5 * df / 32))])
 
 def mask_from_frame(frame):
     """
@@ -508,104 +315,154 @@ def mask_from_frame(frame):
 
     """
 
-    Ik_ = Ik(frame, window=hanning)
-    tonal, non_tonal = sort_maskers(Ik_, group=True)
-    
-    mask = 10.0 ** (_ATH / 10.0)
-    is_tonal = tonal > -inf
-    is_non_tonal = non_tonal > -inf
+    # compute the mask floor (linear scale)    
+    mask_i = 10.0 ** (ATH_i / 10.0)
 
-    for k, b_k in enumerate(_b_k):
-        if is_tonal[k]:
-            mask += 10.0 ** (excitation_pattern(_b, b_k, tonal[k], tonal=True) / 10.0)
-        elif is_non_tonal[k]:
-            mask += 10.0 ** (excitation_pattern(_b, b_k, non_tonal[k], tonal=False) / 10.0)
+    # add the tonals and non-tonals mask values.
+    (k_t, P_t), (k_nt, P_nt) = maskers(frame)
+    for masker_index in arange(len(k_t)):
+        _b, _P = b_k[k_t[masker_index]], P_t[masker_index]
+        mask_i += 10.0 ** (excitation_pattern(b_i, b_m=_b, I=10.0*log10(_P), tonal=True) / 10.0)
+    for masker_index in arange(len(k_nt)):
+        _b, _P = b_k[k_nt[masker_index]], P_nt[masker_index]
+        mask_i += 10.0 ** (excitation_pattern(b_i, b_m=_b, I=10.0*log10(_P), tonal=False) / 10.0)
 
-    mask = 10.0 * log10(mask)
-    subband_mask = array(split(mask, _DENSITY, overlap=1))
-    return amin(subband_mask, axis=1)
- 
+    # convert the resulting mask value to dB
+    mask_i = 10.0 * log10(mask_i)
 
-#def sample_mask(mask, subbands=32, density=16, algo=amin):
-#    """
-#    Compute an array of mask levels in regularly spaced subbands.
+    # select the lowest mask value in each of the 32 subbands.
+    subband_mask = [[] for _ in range(32)]
+    for i, _mask_i in enumerate(mask_i):
+        subband_mask[subband_i[i]].append(_mask_i)
+    for i, _masks in enumerate(subband_mask):
+        subband_mask[i] = amin(_masks)
+    return array(subband_mask)
 
-#    Arguments
-#    ---------
+# TODO: control of frequency units (Hz/bark) and power unit (linear/dB)
+# TODO: display individual excitation pattern fof each masker
+# TODO: better display (fill-between + patch at low freq) of the ATH
+def display_maskers(frame, bark=True, dB=True):
+    # setup x and y-axis unit conversions
+    if bark:
+        convert_f = lambda f: psychoacoustics.bark(f)
+    else:
+        convert_f = lambda f: f
 
-#    - `mask`: a mask function (see `mask_from_frame`),
+    if dB:
+        convert_P = lambda P: 10.0 * log10(P)
+    else:
+        convert_P = lambda P: P
 
-#    - `subbands`: the number of subbands,
+    # f array for high-resolution (1 Hz)
+    n = 22050
+    f = arange(n + 1) / float(n + 1) * 0.5 * df 
+    b = psychoacoustics.bark(f)
 
-#    - `density`: the number of mask values computed per subband,
+    k, P = raw_maskers(frame)
+    P = clip(P, 1e-100, 1e100) # convenience patch for plots
+    plot(convert_f(k * df / N), convert_P(P), "k:")
 
-#    - `algo`: determines how the sequence of mask values for a subband 
-#      generates a single subband mask value. By default,
-#      the lowest value is picked (worst-case mask).
+    #f_k = arange(N // 2 + 1) * df / N
+    #b_k = bark(f_k)
 
-#    Returns
-#    -------
+    def k2b(k):
+        return bark(k * df / N)
 
-#    - `levels`: a sequence of `subbands` mask levels.
+    (k_t, P_t), (k_nt, P_nt) = classify(k, P)
+    k_t_m, P_t_m = merge_tonals(k_t, P_t)
+    k_nt_m, P_nt_m = merge_non_tonals(k_nt, P_nt)
+    k_t_m_t, P_t_m_t = threshold(k_t_m, P_t_m)
+    k_nt_m_t, P_nt_m_t = threshold(k_nt_m, P_nt_m)
+
+#    fill_between(k2b(k), -100.0*ones_like(P), clip(10.0*log10(P), -1000, 1000), color="k", alpha=0.3, label="raw")
+#    #plot(k2b(k_t), 10.0*log10(P_t), "r+", label="raw tonals")  
+#    #plot(k2b(k_nt), 10.0*log10(P_nt), "k+", label="raw non-tonals")  
+#     plot(k2b(k_t_m), 10.0*log10(P_t_m), "m+", label="merged tonals")  
+#    #plot(k2b(k_nt_m), 10.0*log10(P_nt_m), "b+", label="merged non-tonals")
+
+#    # TODO: display only these finals maskers ?
+#    f_k = arange(N // 2 + 1) * df / N
+#    plot(k2b(k), ATH(f_k), "g:", label="ATH") 
+    plot(convert_f(k_t*df/N), convert_P(P_t), "k+")  
+    plot(convert_f(k_nt*df/N), convert_P(P_nt), "k+")     
+    plot(convert_f(k_t_m_t*df/N), convert_P(P_t_m_t), "mo", alpha=0.5, mew=0.0, label="tonals")  
+    plot(convert_f(k_nt_m_t*df/N), convert_P(P_nt_m_t), "bo", alpha=0.5, mew=0.0, label="non-tonals") 
+
+    P_tot = 0.0
+    for _k, _P in zip(k_nt_m_t, P_nt_m_t):
+        _b = psychoacoustics.bark(_k * df / N)
+        ep = excitation_pattern(b, b_m=_b, I=10.0*log10(_P), tonal=False)
+        P_tot += 10.0 ** (ep / 10.0)
+        if not bark:
+            ep = 10.0 ** (ep / 10.0)
+        fill_between(convert_f(f), convert_P(1e-10*ones_like(f)), ep, color="b", alpha=0.2)
+
+    for _k, _P in zip(k_t_m_t, P_t_m_t):
+        _b = psychoacoustics.bark(_k * df / N)
+        ep = excitation_pattern(b, b_m=_b, I=10.0*log10(_P), tonal=True)
+        P_tot += 10.0 ** (ep / 10.0)
+        if not bark:
+            ep = 10.0 ** (ep / 10.0)
+        fill_between(convert_f(f), convert_P(1e-10*ones_like(f)), ep, color="m", alpha=0.2)
+
+    if bark:
+        P_tot = 10 * log10(P_tot)
+    plot(convert_f(f), P_tot, "k-")
 
 
-#    Example
-#    -------
+# -------------------------------------------------------
+    # compute the mask floor (linear scale)    
+    mask_i = 10.0 ** (ATH_i / 10.0)
 
-#        >>> mask = lambda f: 96.0 * (f / 22050.0)
-#        >>> list(sample_mask(mask, subbands=4))
-#        [0.0, 24.0, 48.0, 72.0]
-#    """
-#    f = linspace(0.0, 0.5 * 44100.0, subbands * (density - 1) + 1)
-#    mask_ = array(split(mask(f), density, overlap=1))
-#    return algo(mask_, axis=1)
+    # add the tonals and non-tonals mask values.
+    (k_t, P_t), (k_nt, P_nt) = maskers(frame)
+    for masker_index in arange(len(k_t)):
+        _b, _P = b_k[k_t[masker_index]], P_t[masker_index]
+        mask_i += 10.0 ** (excitation_pattern(b_i, b_m=_b, I=10.0*log10(_P), tonal=True) / 10.0)
+    for masker_index in arange(len(k_nt)):
+        _b, _P = b_k[k_nt[masker_index]], P_nt[masker_index]
+        mask_i += 10.0 ** (excitation_pattern(b_i, b_m=_b, I=10.0*log10(_P), tonal=False) / 10.0)
 
-def display_mask(frame=None, interactive=True):
-    """
-    Display graphically the steps of the mask analysis of a frame of length 512.
-    """
-    if frame is None:
-        t = arange(N) * dt
-        f1 = 7040.0
-        f2 = 14080.0
-        frame = cos(2*pi*f1*t) + 0.01*cos(2*pi*f2*t) 
-    k = arange(257)
-    fk = k / 256.0 * 0.5 * 44100.0 
-    f = linspace(0.0, 0.5 * 44100.0, 1000)
-    gcf()
-    clf()
+    # convert the resulting mask value to dB
+    if dB:
+        mask_i = 10.0 * log10(mask_i)
+
+    plot(convert_f(f_i), mask_i, "k|", ms=100.0)
+
+# --------------------------------------------------------
+
+    m = mask_from_frame(frame)
+    b_subbands = psychoacoustics.bark((arange(32) + 0.5) * (0.5 * df / 32))
+    #plot(b_subbands, m, "ro", label="subband mask")
+    b_boundaries = ravel(split(psychoacoustics.bark(arange(33) * (0.5 * df / 32)), 2, overlap=1))
+    values = ravel([[_m, _m] for _m in m])
+    plot(b_boundaries, values, "r")
+    #fill_between(b_boundaries, -100*ones_like(values), values, color="r", alpha=0.3)
+
+    if bark:
+        x_min, x_max = 0, psychoacoustics.bark(0.5 * df)
+        xticks(arange(25 + 1))
+    else:
+        x_min, x_max = 0.0, 22050.0
+        xticks(arange(0.0, 22050.0, 500.0))
+    if dB:
+        y_min, y_max = -10.0, 100.0
+    else:
+        y_min, y_max = 0.1, 10.0**10
+
+    axis([x_min, x_max, y_min, y_max])
+
+
     grid(True)
-    Ik_ = Ik(frame, window=hanning)
-    tonal_Ik, non_tonal_Ik = sort_maskers(Ik_, group=False)
-    plot(fk, tonal_Ik, "m+", label="tonal maskers")
-    plot(fk, non_tonal_Ik, "b+", label="non-tonal maskers")
-    plot(f, ATH(f), "k--", label="ATH")
-    mask = mask_from_frame(frame)
-    plot(f, mask(f), "k", label="mask")
-    mask_array = sample_mask(mask, subbands=32)
-    array_x2 = kron(mask_array, [1.0, 1.0])
-    f_edges = ravel(split(arange(32 + 1) / 32.0 * 0.5 * 44100.0, 2, overlap=1))
-    plot(f_edges, array_x2, "k", linewidth=1.5, label="subband mask")
-    xlabel("frequency $f$ [Hz]")
-    ylabel("mask level [dB]")
-    legend(loc=4)
-    axis([0.0, 20000.0, -10.0, 100.0])
+    #legend(loc=3)
 
 #
 # Subband Data Vector (Scale Factors) Quantizers
 # ------------------------------------------------------------------------------
 #
-# **Reference scale factors:**
-# "Introduction to Digital Audio Coding and Standards", 
-# by Marina Bosi and Richard E. Goldberg, p. 299.  
-#
 
-_scale_factors = logspace(1, -20, 64, base=2.0)[::-1] 
-
-_bit_pool = 112 # corresponds roughly to 192 kb/s PER CHANNEL (aka twice the
-                # classic high quality setting of MP3).
-
-def allocate_bits(frames, mask, bit_pool=_bit_pool):
+#@profile
+def allocate_bits(frames, mask, bit_pool=None):
     """
     Arguments
     ---------
@@ -623,171 +480,239 @@ def allocate_bits(frames, mask, bit_pool=_bit_pool):
       - `bits`: the number of bits allocated in each subband.    
     
     """
-    frames = array(frames)
     assert shape(frames) == (12, 32)
-    mask = array(mask)
     assert shape(mask) == (32,)
  
-    sf_quantizer = ScaleFactor(_scale_factors)
+    bit_pool = bit_pool or BIT_POOL
+    assert 2 <= bit_pool <= M * 16
+
+    sf_quantizer = ScaleFactor(SCALE_FACTORS)
     sf_subband = zeros(32)
     for subband, frame in enumerate(transpose(frames)):
         sf_index = sf_quantizer.index(frame)
-        sf_subband[subband] = _scale_factors[sf_index]
+        sf_subband[subband] = SCALE_FACTORS[sf_index]
 
-    bits = 32 * [0]
-    # rk: bits[subband] should be limited to 15 bits (not implemented)
-    bit_pool_ = bit_pool
-    while bit_pool_ != 0:
-        delta = 2.0 * sf_subband / 2 ** array(bits)
-        noise_level = 96.0 + 10 * log10((delta ** 2) / 12.0)
-        noise_to_mask = noise_level - mask
-        subband = argmax(noise_to_mask)
-        bits[subband] += 1
-        bit_pool_ = bit_pool_ - 1
-  
-    assert sum(bits) == bit_pool # check that all bits have been allocated
-    return array(bits)
+    bits = zeros(32, dtype=uint8)
+    delta = 2.0 * sf_subband
+    noise_level = 96.0 + 10 * log10((delta ** 2) / 12.0)
+    noise_to_mask = noise_level - mask
+    delta_dB = 10.0 * log10(2.0)
+    while bit_pool >= 2:
+        subband = np.argmax(noise_to_mask)
+        # avoid subbands with a single bit allocated.
+        num_bits = 1 + (noise_to_mask[subband] == 0)
+        bits[subband] += num_bits                   
+        if bits[subband] < 16:
+            noise_to_mask[subband] -= num_bits * delta_dB
+        else: # maximal number of bits reached for this subband
+            noise_to_mask[subband] = - np.inf
+        bit_pool = bit_pool - num_bits
+    if bit_pool == 0: 
+        penalty = np.inf * (bits == 0)
+        subband = np.argmax(noise_to_mask - penalty)
+        if 0 < bits[subband] < 16: # call me paranoid.
+            bits[subband] += 1
 
-# TODO: transfer to quanizers ? Too specific for that ? Transfer a part of it ?
+    return bits
+
+
 class SubbandQuantizer(Quantizer):
-    def __init__(self, mask=None, bit_pool=_bit_pool):
+    def __init__(self, mask, bit_pool=None):
         self.mask = mask
-        self.bit_pool = bit_pool
+        self.bit_pool = bit_pool or BIT_POOL
         self._bits = []
+
     def encode(self, frames):
-        frames = array(frames)
-        assert shape(frames) == (12, 32)
+        frames = np.array(frames)
+        assert np.shape(frames) == (12, 32)
         bits = allocate_bits(frames, self.mask, bit_pool=self.bit_pool)
         self._bits.append(bits)
         quantizers = []
-        for bit in bits:
-            # 0-bit quantizer and 1-bit *midtread* quantizer are alike: 
-            # they have a single admissible value: 0.0.
-            if bit == 1:
-                bit = 0
-            N = max(1, 2**bit - 1)
-            uniform_quantizer = Uniform(N=N)
-            quantizers.append(ScaleFactor(_scale_factors, uniform_quantizer))
+        for i, bit in enumerate(bits):
+            N = 2**bit - 1
+            quantizer = ScaleFactor(SCALE_FACTORS, Uniform(-1.0, 1.0, N))
+            quantizers.append(quantizer)
         output = []
         for subband, frame in enumerate(transpose(frames)):
             index, codes = quantizers[subband].encode(frame)
             output.append([bits[subband], index, codes])
         return output
+
     def decode(self, data):
         frames = []
         for subband in range(32):
             bit, index, codes = data[subband]
-            if bit == 1:
-                bit = 0
-            N = max(1, 2**bit - 1)
-            uniform_quantizer = Uniform(N=N)
-            quantizer = ScaleFactor(_scale_factors, uniform_quantizer)
+            N = 2**bit - 1
+            uniform_quantizer = Uniform(-1.0, 1.0, N)
+            quantizer = ScaleFactor(SCALE_FACTORS, uniform_quantizer)
             frames.append(quantizer.decode((index, codes)))
         return array(transpose(frames))
-    def mean_bit_alloc(self):
-        return round_(mean(self._bits, axis=0), decimals=0).astype(int32)
+
+    #def mean_bit_alloc(self):
+    #    return np.round(mean(self._bits, axis=0), decimals=0).astype(int32)
 
 #
 # Aware Compression
 # ------------------------------------------------------------------------------
 #
 
-def demo(data=None, bit_pool=_bit_pool, play=False, display=False):
+# ... DEPRECATED ...............................................................
+#def __demo(data=None, bit_pool=None, play=False, display=False):
+#    if data is None:
+#        data = square(1760.0, 512*100)
+
+#    assert len(data) >= 1024    
+#    
+#    bit_pool = bit_pool or BIT_POOL
+
+#    # Compute the single mask used for every bit allocation.
+#    reference_frame = data[:512]
+#    length = len(data)
+#    mask = mask_from_frame(reference_frame)
+
+#    if display:
+#        figure()
+#        display_mask(reference_frame)
+#        figure()
+#        display_subbands(data)
+
+#    # Apply the analysis filter bank.
+#    analyze = Analyzer(MPEG.A, dt=MPEG.dt)
+#    data = r_[data, zeros(512)] # take into account the delay:
+#    # without this extra frame, we may not have enough output values.
+#    frames = array(split(data, MPEG.M, zero_pad=True))
+#    subband_frames = array([analyze(frame) for frame in frames])
+
+#    # Make sure we have an entire numbers of 12-sample frames.
+#    remainder = shape(subband_frames)[0] % 12
+#    if remainder:
+#        subband_frames = r_[subband_frames, zeros((12-remainder, 32))]
+
+#    # Quantize the data in each subband.
+#    quant_subband_frames = []
+#    subband_quantizer = SubbandQuantizer(mask, bit_pool=bit_pool)
+#    for i in range(shape(subband_frames)[0] / 12):
+#        subband_frame = subband_frames[i*12:(i+1)*12]
+#        quant_subband_frames.append(subband_quantizer(subband_frame))
+
+#    mean_bits = subband_quantizer.mean_bit_alloc()
+#    if display:
+#        figure()
+#        bar(arange(32.0)-0.4, mean_bits)
+#        xlabel("subband number")
+#        ylabel("number of bits (mean)")
+#        title("Bit Allocation Profile")
+#        grid(True)
+#        axis([-1, 32, 0, max(mean_bits) + 1])
+
+#    # Reconstruct the approximation of the original audio data 
+#    synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
+#    output = []
+#    for frame_12 in quant_subband_frames:
+#        for frame in frame_12:
+#            output.extend(synthesize(frame))
+
+#    # Synchronize input and output data.
+#    output = output[_delay:length+_delay]
+#    
+#    if display:
+#        figure()
+#        plot(arange(512, 1024), data[512:1024], "k-o", ms=3.0, label="original data")
+#        plot(arange(512, 1024), output[512:1024], "r-o", ms=3.0, alpha=0.7, label="compressed data")
+#        xlabel("sample number")
+#        ylabel("sample value")
+#        grid(True)
+#        axis("tight")
+#        legend()
+#        title("Waveforms before/after compression (sample)")
+#        
+#    if play:
+#        sh.rm("-rf", "tmp"); sh.mkdir("tmp")
+#        wave.write(data, "tmp/sound.wav")
+#        wave.write(output, "tmp/sound-aware.wav")
+#        print "playing the original sound ..."
+#        sys.stdout.flush()
+#        time.sleep(1.0)
+#        sh.play("tmp/sound.wav")
+#        print "playing the encoded sound ..."
+#        sys.stdout.flush()
+#        time.sleep(1.0)
+#        sh.play("tmp/sound-aware.wav")
+
+#    return output
+# ..............................................................................
+
+# TODO: investigate a initial 31-sample zero padding instead of computing the
+#       delay induced by the filter. Does it simplify the implementation ?
+#       The resulting delay at the analysis is 256, that means that we only
+#       have to trash the first batch of 8x32 subband values before we start
+#       the subband quantization. So I guess that the answer is yes, that's
+#       simpler.
+
+def demo(data=None, log=False):
     if data is None:
-        data = square(1760.0, 512*100)
-
-    assert len(data) >= 1024    
-    
-    # Compute the single mask used for every bit allocation.
-    reference_frame = data[:512]
-    length = len(data)
-    mask = mask_from_frame(reference_frame)
-
-    if display:
-        figure()
-        display_mask(reference_frame)
-        figure()
-        display_subbands(data)
-
-    # Apply the analysis filter bank.
-    analyze = Analyzer(MPEG.A, dt=MPEG.dt)
-    data = r_[data, zeros(512)] # take into account the delay:
-    # without this extra frame, we may not have enough output values.
-    frames = array(split(data, MPEG.M, zero_pad=True))
-    subband_frames = array([analyze(frame) for frame in frames])
-
-    # Make sure we have an entire numbers of 12-sample frames.
-    remainder = shape(subband_frames)[0] % 12
-    if remainder:
-        subband_frames = r_[subband_frames, zeros((12-remainder, 32))]
-
-    # Quantize the data in each subband.
-    quant_subband_frames = []
-    subband_quantizer = SubbandQuantizer(mask, bit_pool=bit_pool)
-    for i in range(shape(subband_frames)[0] / 12):
-        subband_frame = subband_frames[i*12:(i+1)*12]
-        quant_subband_frames.append(subband_quantizer(subband_frame))
-
-    mean_bits = subband_quantizer.mean_bit_alloc()
-    if display:
-        figure()
-        bar(arange(32.0)-0.4, mean_bits)
-        xlabel("subband number")
-        ylabel("number of bits (mean)")
-        title("Bit Allocation Profile")
-        grid(True)
-        axis([-1, 32, 0, max(mean_bits) + 1])
-
-    # Reconstruct the approximation of the original audio data 
-    synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
-    output = []
-    for frame_12 in quant_subband_frames:
-        for frame in frame_12:
-            output.extend(synthesize(frame))
-
-    # Synchronize input and output data.
-    output = output[_delay:length+_delay]
-    
-    if display:
-        figure()
-        plot(arange(512, 1024), data[512:1024], "k-o", ms=3.0, label="original data")
-        plot(arange(512, 1024), output[512:1024], "r-o", ms=3.0, alpha=0.7, label="compressed data")
-        xlabel("sample number")
-        ylabel("sample value")
-        grid(True)
-        axis("tight")
-        legend()
-        title("Waveforms before/after compression (sample)")
-        
-    if play:
-        sh.rm("-rf", "tmp"); sh.mkdir("tmp")
-        wave.write(data, "tmp/sound.wav")
-        wave.write(output, "tmp/sound-aware.wav")
-        print "playing the original sound ..."
-        sys.stdout.flush()
-        time.sleep(1.0)
-        sh.play("tmp/sound.wav")
-        print "playing the encoded sound ..."
-        sys.stdout.flush()
-        time.sleep(1.0)
-        sh.play("tmp/sound-aware.wav")
-
-    return output
-
-
-def demo2(data=None, report=False):
-    if data is None:
-        data = square(1760.0, 512*100)
+        data = square(1760.0, 44100)
     t = arange(len(data)) * dt
     length = len(t)
     assert length >= 1024
 
-    extra = {} # export mask data and bit allocation profiles.
+    if log:
+        log = {"bits": [], "mask": []}
 
-    # Make sure that to "push" all the relevant values from the anlysis and
+    # Synchronisation
+    # --------------------------------------------------------------------------
+    #
+    # The implementation should be careful to synchronize the input signal,
+    # the mask computations, the subband quantization and the output signal.
+    # Here is how we proceed:
+    # 
+    #  1. First off, we add M - 1 zero samples at the head of the data,
+    #     to compensate for the advance induced by our implementation of
+    #     the polyphase analysis filter.
+    #
+    #  2. Given that compensation the subband data is delayed with respect to 
+    #     the input signal by N // 2 samples as a consequence of the causal 
+    #     implementation of the analysis filters. We process this early data
+    #     in the subbands anyway for a correct synthesis filter warm-up.
+    #
+    #  3. We need to delay the first mask computation by N // 2 samples.
+    #     We do that by adding N // 2 zeros at the start of the data used
+    #     by the mask computations. To take into account the overlap of 
+    #     N_FFT - L samples between successive analysis windows, we add
+    #     (N_FFT - L) // 2 extra zero samples.
+    #  
+    #  4. The total delay induced by the analysis and synthesis being N samples,
+    #     we add an extra frame at the end of the signal to be able to produce
+    #     the last values. We may have to add a little more samples at the end,
+    #     just to make sure than the subband data may be grouped in an entire
+    #     number of frames of length L.
+    #
+    #  5. During the decompression, all we have to do is to drop the first
+    #     frame of N samples and to used the data length of the binary format 
+    #     to stop at the right point.
+
+    # The delay computation to get the spectral analysis and the frame 
+    # compression right has to be done carefully:
+    # 
+    #   - the "polyphase implementation hack" that avoids to compute an initial
+    #     almost empty frame. It corresponds to an *advance* of M - 1 samples.
+    #
+    #   - the way the analysis filter is implemented (N-sample impulse response
+    #     with N even and a leading 0 added for parity) induces an extra 256 
+    #     delay
+    #
+    # This sums up to 225 delay. 
+    #
+    # WHOOT ? That should be 256 - 31, not +31, right ??? So 225
+
+    analysis_delay  = - (M - 1) + N // 2
+    synthesis_delay = N // 2
+    total_delay = analysis_delay + synthesis_delay
+
+    # Make sure that to "push" all the relevant values from the analysis and
     # synthesis registers by feeding extra zeros at the end of the signal.
-    # As the total delay is 481 (-31 + 256 + 256), a frame of 512 is fine.
-    data = r_[data, zeros(512)]
+    # As the total delay is 481, a frame of 512 is fine.
+    data = r_[data, np.zeros(N)]
     
     # Compute the masks to use for bit allocation.
     # --------------------------------------------------------------------------
@@ -796,27 +721,19 @@ def demo2(data=None, report=False):
     # by the FFT of 128 samples, 64 before and 64 after the 'real' data.
     # This is used in conjunction with Hanning window, so this actually make
     # sense.
-    # 
-    # The delay computation to get the spectral analysis and the frame 
-    # compression right has to be done carefully:
-    # 
-    #   - the "polyphase implementation hack" that avoids to compute an initial
-    #     almost empty frame. It corresponds to an *advance* of M - 1 = 31 samples.
-    #
-    #   - the way the analysis filter is implemented (512-sample impulse with a
-    #     a leading 0 added for parity) induces an extra 256 delay
-    #
-    # This sums up to 287 delay. To perform the spectral analysis, we could
-    # create a buffer with 287 + 64 = 351 zeros in front of the real data,
+    # To perform the spectral analysis, we could
+    # create a buffer with 225 + 64 = 289 zeros in front of the real data,
     # then perform the first mask computation at the buffer start and shift
     # by 384 until the end of the signal is obtained.
     #
     
     # TODO: interleave the mask computation / bit allocation ? for frame-by
-    #       frame computation ?
-    mask_frames = split(r_[zeros(351), data], 512, zero_pad=True, overlap=128) 
+    #       frame computation ? 
+    mask_frames = split(r_[zeros(analysis_delay + (N - L) // 2), data], 
+                        N, zero_pad=True, overlap=(N - L)) 
     masks = [mask_from_frame(frame) for frame in mask_frames]
-    extra["mask"] = masks
+    if log:
+        log["mask"] = masks
 
     # Apply the analysis filter bank.
     analyze = Analyzer(MPEG.A, dt=MPEG.dt)
@@ -824,19 +741,20 @@ def demo2(data=None, report=False):
     subband_frames = array([analyze(frame) for frame in frames])
 
     # Make sure we have an entire numbers of 12-sample frames.
-    remainder = shape(subband_frames)[0] % 12
+    remainder = shape(subband_frames)[0] % (L / M)
     if remainder:
-        subband_frames = r_[subband_frames, zeros((12-remainder, 32))]
+        subband_frames = r_[subband_frames, zeros((L / M - remainder, M))]
 
     # Quantize the data in each subband.
     quant_subband_frames = []
-    mean_bits = []
-    for i in range(shape(subband_frames)[0] / 12):
+    #mean_bits = []
+    for i in range(shape(subband_frames)[0] / (L / M)):
         subband_quantizer = SubbandQuantizer(masks[i])
-        subband_frame = subband_frames[i*12:(i+1)*12]
+        subband_frame = subband_frames[i*(L / M):(i+1)*(L / M)]
         quant_subband_frames.append(subband_quantizer(subband_frame))
-        mean_bits.append(subband_quantizer.mean_bit_alloc())
-    extra["bits"] = mean_bits
+        #mean_bits.append(subband_quantizer.mean_bit_alloc())
+        if log:
+            log["bits"].extend(subband_quantizer._bits)
 
     # Reconstruct the approximation of the original audio data 
     synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
@@ -847,10 +765,11 @@ def demo2(data=None, report=False):
 
     # Synchronize input and output data.
     data = data[:length]
-    output = output[_delay:length+_delay]
+    output = output[total_delay:length+total_delay]
 
-    if report:
-        return output, extra
+    if log:
+        log["bits"] = array(log["bits"])
+        return output, log
     else:
         return output
 
@@ -870,7 +789,17 @@ def test():
 # ------------------------------------------------------------------------------
 #
 
+# TODO: drop the first frames in the quantizer to deliver some data in
+#       phase with the input ? That may prove to be difficult, otherwise
+#       store some offset info in the binary file for the offset deletion
+#       at the reconstruction. Yes, we need the same trick for the end
+#       anyway.
+
+
 if __name__ == "__main__":
+    demo(log=True)
+
+if __name__ == "__main____":
     # TODO: get the extra analysis data and save it in another file ? Y.
     # AH FUCK, what to do with the dual channels ? Whatever, the support
     # for stereo should be migrated to demo2 first (BTW, rename that crap,
@@ -882,6 +811,6 @@ if __name__ == "__main__":
     # TODO: support stereo directly in demo2
     output = zeros_like(data)
     for i, channel in enumerate(data):
-        output[i,:] = demo2(channel, display=False, play=False)
+        output[i,:] = demo2(channel)
     wave.write(output, output_file)
 
