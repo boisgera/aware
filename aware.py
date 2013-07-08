@@ -90,6 +90,7 @@ pass
 # ------------------------------------------------------------------------------
 #
 
+# TODO: improve and put in a 'display' section ?
 def display_subbands(data):
     analyze = Analyzer(MPEG.A, dt=MPEG.dt)
     # Add zeros at the head to implement strictly the polyphase filter
@@ -159,6 +160,7 @@ class Classifier(object):
                     k_t.append(_k)
                     P_t.append(P[_k-1] + P[_k] + P[_k+1])
                     P[_k-1] = P[_k] = P[_k+1] = 0.0
+        # N.B.: there is no cleanup of 0 power maskers in non-tonals.
         return (array(k_t), array(P_t)), (k, P)        
 
 classify = Classifier()
@@ -168,9 +170,13 @@ def group_by_critical_band(k, P):
     f_k = arange(N // 2 + 1) * df / N
     b_k = bark(f_k)
     cb_k = array([int(b) for b in floor(b_k)])
-    bands = [[] for _ in arange(amax(cb_k) + 1)]
+    bands = [[[], []] for _ in arange(amax(cb_k) + 1)]
     for _k, _P in zip(k, P):
-        bands[cb_k[_k]].append((_k, _P))
+        band = bands[cb_k[_k]]
+        band[0].append(_k)
+        band[1].append(_P)
+    for b, band in enumerate(bands):
+        bands[b] = np.array(band)
     return bands
 
 # rename "merge_tonals" (optimization "T" for tone)
@@ -183,10 +189,10 @@ def merge_tonals(k_t, P_t):
     bands = group_by_critical_band(k_t, P_t)
     k_t_out, P_t_out = [], []
     for band, k_P_s in enumerate(bands):
-        if k_P_s:
+        if len(k_P_s[0]):
             k_max = None
             P_max = - inf 
-            for (_k, _P) in k_P_s:
+            for _k, _P in zip(*k_P_s):
                if _P > P_max:
                    k_max = _k
                    P_max = _P
@@ -196,22 +202,26 @@ def merge_tonals(k_t, P_t):
 
 
 # (optimization "N" noise)
+#@profile
 def merge_non_tonals(k_nt, P_nt):
     bands = group_by_critical_band(k_nt, P_nt)
-    k_nt_out = zeros(len(bands), dtype=uint8)
-    P_nt_out = zeros(len(bands))
+    k_nt_out = np.zeros(len(bands), dtype=uint8)
+    P_nt_out = np.zeros(len(bands))
     for band, k_P_s in enumerate(bands):
-        if k_P_s:
-            k_P_array = array(k_P_s)
-            k = k_P_array[:,0]
-            P = k_P_array[:,1]
-            P_sum = sum(P)
+        if len(k_P_s[0]):
+            # find another way, this array creation takes to much time.
+            # maybe change the structure returned by group_by_critical_band, see
+            # if that would also be acceptable in merge_tonals.
+            k, P = k_P_s
+            P_sum = np.sum(P)
             # k_mean: not sure that's the best thing to do.
             # geometric mean suggested by Rosi. I believe that an 
             # arithmetic mean in the bark scale is better yet.
-            if all(P == 0.0):
-                P = ones_like(P)
-            k_mean = int(round(average(k, weights=P))) 
+
+            if P_sum == 0.0:
+                P = np.ones_like(P)
+            k_mean = int(np.round(np.average(k, weights=P))) 
+
             #bark_mean = mean([bark(k[i] * df / N) for i in arange(len(k)) 
             #                  if P[i]>0])            
             #k_mean = int(round(hertz(bark_mean) * N / df))
@@ -338,6 +348,8 @@ def mask_from_frame(frame):
         subband_mask[i] = amin(_masks)
     return array(subband_mask)
 
+# TODO: clean up this plot. Forget the scales, that's too much of a mess
+#       instead, opt for barks and dB and clean up the code accordingly.
 # TODO: control of frequency units (Hz/bark) and power unit (linear/dB)
 # TODO: display individual excitation pattern fof each masker
 # TODO: better display (fill-between + patch at low freq) of the ATH
@@ -461,8 +473,9 @@ def display_maskers(frame, bark=True, dB=True):
 # ------------------------------------------------------------------------------
 #
 
-#@profile
-def allocate_bits(frames, mask, bit_pool=None):
+# TODO: display bit allocation with a stackplot.
+
+def allocate_bits(frames, mask, bit_pool=BIT_POOL):
     """
     Arguments
     ---------
@@ -482,8 +495,7 @@ def allocate_bits(frames, mask, bit_pool=None):
     """
     assert shape(frames) == (12, 32)
     assert shape(mask) == (32,)
- 
-    bit_pool = bit_pool or BIT_POOL
+
     assert 2 <= bit_pool <= M * 16
 
     sf_quantizer = ScaleFactor(SCALE_FACTORS)
@@ -517,9 +529,9 @@ def allocate_bits(frames, mask, bit_pool=None):
 
 
 class SubbandQuantizer(Quantizer):
-    def __init__(self, mask, bit_pool=None):
+    def __init__(self, mask, bit_pool=BIT_POOL):
         self.mask = mask
-        self.bit_pool = bit_pool or BIT_POOL
+        self.bit_pool = bit_pool
         self.bits = []
 
     def encode(self, frames):
@@ -555,6 +567,11 @@ class SubbandQuantizer(Quantizer):
 # Aware Compression
 # ------------------------------------------------------------------------------
 #
+
+# TODO: functions that displays on the same graph (sync axes) the original data,
+#       the compressed/decompressed data and on a 2nd figure, the stack of masks
+#       with the appropriate colormaps and fill_betweens.
+
 
 # ... DEPRECATED ...............................................................
 #def __demo(data=None, bit_pool=None, play=False, display=False):
@@ -642,11 +659,10 @@ class SubbandQuantizer(Quantizer):
 #    return output
 # ..............................................................................
 
-
-# TODO: instead of the log approach, develop a "locals capture" aka snapshot ?
-#       such that ALL relevant variables are captured but there is no change
-#       is the pattern that is returned ? Capture only the variables that 
-#       are listed as keys in snapshot ?
+# TODO: decompose the 'demo' into compression / decompression, the intermediate
+#       data being a bitstream.
+# TODO: rename that function
+# TODO: support stereo data
 def demo(data, snapshot=None):
     data = np.array(data)
 
@@ -747,15 +763,8 @@ def test():
 # ------------------------------------------------------------------------------
 #
 
-# TODO: drop the first frames in the quantizer to deliver some data in
-#       phase with the input ? That may prove to be difficult, otherwise
-#       store some offset info in the binary file for the offset deletion
-#       at the reconstruction. Yes, we need the same trick for the end
-#       anyway.
-
-
 if __name__ == "__main__":
-    demo()
+    demo(square(1760.0, 44100))
 
 if __name__ == "__main____":
     # TODO: get the extra analysis data and save it in another file ? Y.
@@ -769,6 +778,6 @@ if __name__ == "__main____":
     # TODO: support stereo directly in demo2
     output = zeros_like(data)
     for i, channel in enumerate(data):
-        output[i,:] = demo2(channel)
+        output[i,:] = demo(channel)
     wave.write(output, output_file)
 
