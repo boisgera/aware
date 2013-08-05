@@ -18,6 +18,7 @@ import pylab as pl
 from pylab import *; seterr(all="ignore")
 
 # Digital Audio Coding
+import bitstream
 from filters import MPEG, Analyzer, Synthesizer
 from frames import split
 import psychoacoustics
@@ -56,7 +57,7 @@ L = 12 * M
 
 # number of bits available for every sequence of M subband samples
 BIT_POOL = 112
-assert 2 <= BIT_POOL <= M * 16
+assert BIT_POOL <= M * 16
 
 # scale factor used by the subband quantizer 
 SCALE_FACTORS = logspace(1, -20, 64, base=2.0)[::-1] 
@@ -170,7 +171,7 @@ def group_by_critical_band(k, P):
     f_k = arange(N // 2 + 1) * df / N
     b_k = bark(f_k)
     cb_k = array([int(b) for b in floor(b_k)])
-    bands = [[[], []] for _ in arange(amax(cb_k) + 1)]
+    bands = [[[], []] for _ in arange(np.amax(cb_k) + 1)]
     for _k, _P in zip(k, P):
         band = bands[cb_k[_k]]
         band[0].append(_k)
@@ -473,7 +474,7 @@ def display_maskers(frame, bark=True, dB=True):
 # ------------------------------------------------------------------------------
 #
 
-# TODO: display bit allocation with a stackplot.
+# TODO: display bit allocation with a stackplot. Warning: overloaded in _aware
 
 def allocate_bits(frames, mask, bit_pool=BIT_POOL):
     """
@@ -496,7 +497,7 @@ def allocate_bits(frames, mask, bit_pool=BIT_POOL):
     assert shape(frames) == (12, 32)
     assert shape(mask) == (32,)
 
-    assert 2 <= bit_pool <= M * 16
+    assert bit_pool <= M * 16
 
     sf_quantizer = ScaleFactor(SCALE_FACTORS)
     sf_subband = zeros(32)
@@ -512,16 +513,16 @@ def allocate_bits(frames, mask, bit_pool=BIT_POOL):
     while bit_pool >= 2:
         subband = np.argmax(noise_to_mask)
         # avoid subbands with a single bit allocated.
-        num_bits = 1 + (noise_to_mask[subband] == 0)
+        num_bits = 1 + (bits[subband] == 0)
         bits[subband] += num_bits                   
         if bits[subband] < 16:
             noise_to_mask[subband] -= num_bits * delta_dB
         else: # maximal number of bits reached for this subband
             noise_to_mask[subband] = - np.inf
         bit_pool = bit_pool - num_bits
-    if bit_pool == 0: 
-        penalty = np.inf * (bits == 0)
-        subband = np.argmax(noise_to_mask - penalty)
+    if bit_pool != 0: 
+        noise_to_mask[bits == 0] = -inf
+        subband = np.argmax(noise_to_mask)
         if 0 < bits[subband] < 16: # call me paranoid.
             bits[subband] += 1
 
@@ -529,7 +530,7 @@ def allocate_bits(frames, mask, bit_pool=BIT_POOL):
 
 
 class SubbandQuantizer(Quantizer):
-    def __init__(self, mask, bit_pool=BIT_POOL):
+    def __init__(self, mask=None, bit_pool=BIT_POOL):
         self.mask = mask
         self.bit_pool = bit_pool
         self.bits = []
@@ -663,6 +664,70 @@ class SubbandQuantizer(Quantizer):
 #       data being a bitstream.
 # TODO: rename that function
 # TODO: support stereo data
+# TODO: define the binary format:
+#
+#  - "AWAR"
+#  - number of samples / channel
+#  - number of channels (uint8)
+#  
+#  then compute a number of 384-sample frames:
+#  pick len, add N, divide by 384, make a ceil, that's it.
+#
+#  - repeat for every channel:
+#      - repeat for every frame:
+#          - number of bits / subband (32 x uint4)
+#          - scale factor indices (32 x uint6)
+#          - repeat 12 times: the 32 int? quantifier values.
+
+#
+# Unsigned Integers of Arbitrary Size
+# ------------------------------------------------------------------------------
+#
+
+# TODO: transfer to bitstream
+class uint(object):
+    def __init__(self, num_bits):
+        self.num_bits = num_bits
+
+def write_uint_factory(instance):
+    num_bits = instance.num_bits
+    def write_uint(stream, data):
+        if isinstance(data, (list, np.ndarray)):
+            for integer in data:
+                write_uint(stream, integer)
+        else:
+            integer = int(data)
+            if integer < 0:
+                error = "negative integers cannot be encoded"
+                raise ValueError(error)
+            bools = []
+            for _ in range(num_bits):
+                bools.append(integer & 1)
+                integer = integer >> 1
+            bools.reverse()
+            stream.write(bools, bool)
+    return write_uint
+
+def read_uint_factory(instance):
+    num_bits = instance.num_bits
+    def read_uint(stream, n=None):
+        if n is None:
+            integer = 0
+            for _ in range(num_bits):
+                integer = integer << 1
+                if stream.read(bool):
+                    integer += 1
+            return integer
+        else:
+            integers = [read_uint(stream) for _ in range(n)]
+            return integers
+    return read_uint
+
+bitstream.register(uint, writer=write_uint_factory, reader=read_uint_factory)
+
+# Stream: fuck up because 1 bit is used in the bit allocation when it should
+# not.
+
 def demo(data, snapshot=None):
     data = np.array(data)
 
@@ -734,6 +799,50 @@ def demo(data, snapshot=None):
         bits.extend(subband_quantizer.bits)
     bits = np.array(bits)
 
+    # Create a binary stream (encode)
+    stream = bitstream.BitStream()
+    stream.write("AWAR")
+    stream.write(len(data), np.uint32)
+    stream.write(0, uint8) # mono
+    num_frames = int(np.ceil((len(data) + N) / L))
+    for i in range(num_frames):
+#        print 40*"-"
+#        print "frame", i
+        subband_quantizer = SubbandQuantizer(masks[i])
+        subband_frame = subband_frames[i*(L // M) : (i+1)*(L // M)]
+        subband_codes = subband_quantizer.encode(subband_frame)
+        for num_bits, sf_index, codes in subband_codes:
+#            print num_bits, sf_index, codes
+            stream.write(max(0, num_bits - 1), uint(4))
+            stream.write(sf_index, uint(6))
+            stream.write(codes, uint(num_bits))
+
+    # Decode the stream
+    assert stream.read(str, 4) == "AWAR"
+    len_data = stream.read(np.uint32)
+    assert stream.read(uint8) == 0
+    num_frames = int(np.ceil((len_data + N) / L))
+
+    subband_quantizer = SubbandQuantizer()
+    _subband_frames = []
+    for i in range(num_frames):
+        _subband_codes = []
+        for subband in range(M):
+            num_bits = stream.read(uint(4))
+            if num_bits:
+                num_bits = num_bits + 1
+            sf_index = stream.read(uint(6))
+            codes = np.array(stream.read(uint(num_bits), L // M))
+            _subband_codes.append([num_bits, sf_index, codes])
+        _subband_frames.append(subband_quantizer.decode(_subband_codes))
+
+    _synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
+    _output = []
+    for frames in _subband_frames:
+        for frame in frames:
+            _output.extend(_synthesize(frame))
+    _output = _output[N:N+len_data]
+
     # Reconstruct the (approximation of) the original audio data 
     synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
     output = []
@@ -745,12 +854,174 @@ def demo(data, snapshot=None):
     if snapshot is not None:
         snapshot.update(locals())
 
+    print output == _output # yessir !
+
     return output
+
+# TODO:
+#   - several channel support,
+#   - command-line tool (generate a file),
+#   - timing to see if i can get rid of the shortcut that generates no stream.
+
+def compress(data, snapshot=None):
+    data = np.array(data)
+
+    # Synchronisation
+    # --------------------------------------------------------------------------
+    #
+    # The implementation should be careful to synchronize the input signal,
+    # the mask computations, the subband quantization and the output signal.
+    # Here is how we proceed:
+    # 
+    #  1. First off, we add M - 1 zero samples at the head of the data,
+    #     to compensate for the advance induced by our implementation of
+    #     the polyphase analysis filter.
+    #
+    #  2. Given that compensation the subband data is delayed with respect to 
+    #     the input signal by N // 2 samples as a consequence of the causal 
+    #     implementation of the analysis filters. We process this early data
+    #     in the subbands anyway for a correct synthesis filter warm-up.
+    #
+    #  3. We need to delay the first mask computation by N // 2 samples.
+    #     We do that by adding N // 2 zeros at the start of the data used
+    #     by the mask computations. To take into account the overlap of 
+    #     N_FFT - L samples between successive analysis windows, we add
+    #     (N_FFT - L) // 2 extra zero samples.
+    #  
+    #  4. The total delay induced by the analysis and synthesis being N samples,
+    #     we add an extra frame at the end of the signal to be able to produce
+    #     the last values. We may have to add a little more samples at the end,
+    #     just to make sure than the subband data may be grouped in an entire
+    #     number of frames of length L.
+    #
+    #  5. During the decompression, all we have to do is to drop the first
+    #     frame of N samples and to used the data length of the binary format 
+    #     to stop at the right point.
+
+    # Compute the masks
+    overlap = N_FFT - L
+    head = np.zeros(N // 2 + overlap // 2)
+    tail = np.zeros(N + L + overlap // 2) # covers the worst-case
+    data_mask_sync = np.r_[head, data, tail]
+    mask_frames = split(data_mask_sync, N_FFT, zero_pad=True, overlap=(N - L)) 
+    masks = [mask_from_frame(frame) for frame in mask_frames]
+
+    # Apply the analysis filter bank.
+    head = np.zeros(M-1)
+    tail = np.zeros(N)
+    data_filter_sync = np.r_[head, data, tail]
+    # enforce a data length that is a multiple of L
+    extra_tail = np.zeros((L - len(data_filter_sync) % L) % L)
+    data_filter_sync = np.r_[data_filter_sync, extra_tail]
+    analyze = Analyzer(MPEG.A, dt=MPEG.dt)
+    frames = np.array(split(data_filter_sync, MPEG.M, zero_pad=True))
+    subband_frames = array([analyze(frame) for frame in frames])
+
+    # Quantize the subband data
+    quant_subband_frames = []
+    bits = []
+    assert shape(subband_frames)[0] % (L // M) == 0
+    num_blocks = shape(subband_frames)[0] // (L // M)
+    for i in range(num_blocks):
+        subband_quantizer = SubbandQuantizer(masks[i])
+        subband_frame = subband_frames[i*(L // M) : (i+1)*(L // M)]
+        quant_subband_frames.append(subband_quantizer(subband_frame))
+        bits.extend(subband_quantizer.bits)
+    bits = np.array(bits)
+
+    # Encode this data as a binary stream
+    stream = bitstream.BitStream()
+    stream.write("AWAR")
+    stream.write(len(data), np.uint32)
+    stream.write(0, uint8) # mono
+    num_frames = int(np.ceil((len(data) + N) / L))
+    for i in range(num_frames):
+        subband_quantizer = SubbandQuantizer(masks[i])
+        subband_frame = subband_frames[i*(L // M) : (i+1)*(L // M)]
+        subband_codes = subband_quantizer.encode(subband_frame)
+        for num_bits, sf_index, codes in subband_codes:
+            stream.write(max(0, num_bits - 1), uint(4))
+            stream.write(sf_index, uint(6))
+            stream.write(codes, uint(num_bits))
+
+    if snapshot is not None:
+        snapshot.update(locals())
+
+    return stream
+
+def decompress(stream, snapshot=None):
+    if stream.read(str, 4) != "AWAR":
+        raise ValueError("invalid format")
+    len_data = stream.read(np.uint32)
+    assert stream.read(uint8) == 0
+    num_frames = int(np.ceil((len_data + N) / L))
+
+    subband_quantizer = SubbandQuantizer()
+    _subband_frames = []
+    for i in range(num_frames):
+        _subband_codes = []
+        for subband in range(M):
+            num_bits = stream.read(uint(4))
+            if num_bits:
+                num_bits = num_bits + 1
+            sf_index = stream.read(uint(6))
+            codes = np.array(stream.read(uint(num_bits), L // M))
+            _subband_codes.append([num_bits, sf_index, codes])
+        _subband_frames.append(subband_quantizer.decode(_subband_codes))
+
+    _synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
+    _output = []
+    for frames in _subband_frames:
+        for frame in frames:
+            _output.extend(_synthesize(frame))
+    _output = _output[N:N+len_data]
+
+    if snapshot is not None:
+        snapshot.update(locals())
+
+    return output
+
+#
+# Cython Optimization
+# ------------------------------------------------------------------------------
+#
+
+# TODO: better: let _aware acces the contents of aware defined so far (ok, easy)
+#       Make more tests (external, to be available even when the function is
+#       overriden by _aware content).
+#       Find a way to dump the docstring is this module onto the optimized
+#       versions ?
+try:
+    from _aware import excitation_pattern, allocate_bits, classify
+except ImportError:
+    pass
 
 # 
 # Unit Test Runner
 # ------------------------------------------------------------------------------
 #
+
+def test_allocate_bits():
+    """
+    >>> frame = np.ones((12, 32))
+    >>> mask = 50.0 * ones(32)
+    >>> bits = allocate_bits(frame, mask, 0)
+    >>> all(bits == 0)
+    True
+    >>> bits = allocate_bits(frame, mask, 32*16)
+    >>> all(bits == 16)
+    True
+    >>> bits = allocate_bits(frame, mask, 112)
+    >>> all(3 <= bits) and all(bits <= 4)
+    True
+
+    >>> frame = np.zeros((12, 32))
+    >>> for i in range(7):
+    ...    frame[:,i] = 1.0
+    >>> bits = allocate_bits(frame, mask, 112)
+    >>> all(bits[:7] == 16) and all(bits[7:] == 0)
+    True
+    """
 
 def test():
     """
@@ -764,7 +1035,10 @@ def test():
 #
 
 if __name__ == "__main__":
-    demo(square(1760.0, 44100))
+    if "--test" in sys.argv:
+        test()
+    else:
+        demo(square(1760.0, 44100))
 
 if __name__ == "__main____":
     # TODO: get the extra analysis data and save it in another file ? Y.

@@ -2,5 +2,12 @@
 *.pyc
 *.wav
 *.bak
+*.html
+*.prof
+*.lprof
+*.c
+
+sandbox
+build
 profiles
 

@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 # coding: utf-8
-# cython: profile=True
 """
 Aware -- Perceptual Audio Coder
 """
@@ -18,15 +17,10 @@ from pylab import *; seterr(all="ignore")
 # Digital Audio Coding
 from filters import MPEG
 from frames import split
-from psychoacoustics import ATH, bark, Mask
+import psychoacoustics
+from psychoacoustics import ATH, bark, hertz, Mask
 from quantizers import Quantizer, ScaleFactor, Uniform
 import wave
-
-# Cython
-cimport cython
-cimport numpy as np
-cimport cpython
-from libc.math cimport log10 as math_log10
 
 #
 # Metadata
@@ -343,8 +337,7 @@ def Ik(x, window=ones, dB=True):
     x = alpha * window(n) * x
 
     xk2 = abs(fft(x)) ** 2
-    half_n = n / 2 + 1 # 3 -> 2, 4 -> 3, 5 -> 3, 6 -> 4, etc.
-    Ik = 2.0 * xk2[:half_n] / n ** 2
+    Ik = 2.0 * xk2[:N/2+1] / n ** 2
     Ik[0] = 0.5 * Ik[0]
     if (n % 2 == 0):
         Ik[-1] = 0.5 * Ik[-1]
@@ -453,13 +446,138 @@ def sort_maskers(Ik, group=False):
     return t_maskers, nt_maskers
     
 
-cdef unsigned char add_excitation_pattern(
-  np.ndarray[np.float64_t, ndim=1] b, 
-  double b_m, 
-  double I, 
-  unsigned char tonal,
-  np.ndarray[np.float64_t, ndim=1] out
-):
+# ------------------------------------------------------------------------------
+# New version, more simplifications, decomposed in stages.
+
+def raw_maskers(frame, window=hanning):
+    frame = array(frame, copy=False)
+    if shape(frame) != (N,):
+        error = "the frame should be 1-dim. with {0} samples."
+        raise TypeError(error.format(N))
+
+    # Compute a gain alpha that compensates the energy loss caused by the 
+    # windowing -- a frame with constant values is used as a reference.
+    alpha = 1.0 / sqrt(sum(window(N)**2) / N)
+    x = alpha * window(N) * frame
+
+    k = arange(N / 2 + 1)
+    frame_fft_2 = abs(fft(frame)) ** 2
+
+    P = 2.0 * frame_fft_2[:(N / 2 + 1)] / N ** 2
+    P[0] = 0.5 * P[0]
+    if (N % 2 == 0):
+        P[-1] = 0.5 * P[-1]
+
+    # +96 dB normalization
+    P = 10.0 ** (96.0 / 10.0) * P
+    
+    return k, P
+
+
+def classify(k, P):
+    assert all(k == arange(N / 2 + 1))
+    k_t, k_nt = [], []
+    P_t, P_nt = [], []
+    for _k in k: 
+        if _k <= 2 or _k > 250:
+            continue
+        elif 2 < _k < 63:
+            js = [-2, +2]
+        elif 63 <= _k < 127:
+            js = [-3, -2, +2, +3]
+        elif 127 <= _k <= 250:
+            js = [-6, -5, -4, -3, -2, +2, +3, +4, +5, +6]
+        if (P[_k-1] <= P[_k] and P[_k+1] <= P[_k] and 
+            all([P[_k] >= 5.0 * P[_k+j] for j in js])): # +7.0 dB
+            k_t.append(_k)
+            P_t.append(P[_k-1] + P[_k] + P[_k+1])
+    for _k in k:
+        if not (_k-1 in k_t or _k in k_t or _k+1 in k_t):
+            k_nt.append(_k)
+            P_nt.append(P[_k])
+    return (array(k_t), array(P_t)), (array(k_nt), array(P_nt))
+
+def group_by_critical_band(k, P):
+    # cb_k: critical band number indexed by frequency line index k.
+    f_k = arange(N / 2 + 1) * df / N
+    b_k = bark(f_k)
+    cb_k = array([int(b) for b in floor(b_k)])
+
+    bands = dict([(cb, []) for cb in arange(amax(cb_k) + 1)])
+    for _k, _P in zip(k, P):
+        bands[cb_k[_k]].append((_k, _P))
+    return bands
+
+# rename "merge_tonals" (optimization "T" for tone)
+# rk: that's not exactly what I've read about: this is not a cb by cb matter
+#     but a merge if the distance between 2 k's is < 0.5 bark.
+# 
+# TODO: replace the entire k by (floating-point) f_k ? Would induce less
+#       error in the mask computations at low-freq.
+def merge_tonals(k_t, P_t):
+    bands = group_by_critical_band(k_t, P_t)
+    k_t_out, P_t_out = [], []
+    for band, k_P_s in bands.items():
+        if k_P_s:
+            k_max = None
+            P_max = - inf 
+            for (_k, _P) in k_P_s:
+               if _P > P_max:
+                   k_max = _k
+                   P_max = _P
+            k_t_out.append(k_max)
+            P_t_out.append(P_max)
+    return array(k_t_out), array(P_t_out)
+
+
+# (optimization "N" noise)
+def merge_non_tonals(k_nt, P_nt):
+    bands = group_by_critical_band(k_nt, P_nt)
+    k_nt_out, P_nt_out = [], []
+    for band, k_P_s in bands.items():
+        if k_P_s:
+            k_P_array = array(k_P_s)
+            k = k_P_array[:,0]
+            P = k_P_array[:,1]
+            P_sum = sum(P)
+            # k_mean: not sure that's the best thing to do.
+            # geometric mean suggested by Rosi. I believe that an 
+            # arithmetic mean in the bark scale is better yet.
+            if all(P == 0.0):
+                P = ones_like(P)
+            k_mean = int(round(average(k, weights=P))) 
+            #bark_mean = mean([bark(k[i] * df / N) for i in arange(len(k)) 
+            #                  if P[i]>0])            
+            #k_mean = int(round(hertz(bark_mean) * N / df))
+            #print "k, k_mean:", k, k_mean
+            k_nt_out.append(k_mean)
+            P_nt_out.append(P_sum)
+    return array(k_nt_out), array(P_nt_out)
+
+# "T" for threshold ? "A" for absolute ?
+def threshold(k, P):
+    f_k = arange(N / 2 + 1) * df / N
+    ATH_k = 10 ** (ATH(f_k) / 10.0)
+    k_out, P_out = [], []
+    for (_k, _P) in zip(k, P):
+        if _P > ATH_k[_k]:
+            k_out.append(_k)
+            P_out.append(_P)
+    return array(k_out), array(P_out)
+
+def maskers(frame):
+    k, P = raw_maskers(frame)
+    (k_t, P_t), (k_nt, P_nt) = classify(k, P)
+    k_t, P_t = merge_tonals(k_t, P_t)
+    k_nt, P_nt = merge_non_tonals(k_nt, P_nt)
+    k_t, P_t = threshold(k_t, P_t)
+    k_nt, P_nt = threshold(k_nt, P_nt)
+    return (k_t, P_t), (k_nt, P_nt)
+
+
+#-------------------------------------------------------------------------------
+
+def excitation_pattern(b, b_m, I, tonal):
     """
     Compute the excitation pattern of a single masker.
 
@@ -467,52 +585,41 @@ cdef unsigned char add_excitation_pattern(
 
     Arguments
     --------
-      - `b`: array of frequencies in barks,
+      - `b`: scalar or array of frequencies in barks,
       - `b_m`: masker frequency (in barks),
       - `I`: masker power (in dB),
       - `tonal`: `True` if the masker is tonal, `False` otherwise.
-      - `out`: the array where the result is added (intensity values)
+
+    Returns
+    -------
+
+      - `mask`: array of excitation values in dB.
+
     """
-    
-    cdef unsigned int i 
-    cdef unsigned int n = len(b)
-    cdef double db
-    cdef double mask
+    db = b - b_m
+    mask  = I \
+          - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
+          - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
+          - (17.0           ) * ( db      ) * (db >=  0.0) \
+          + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
+    if tonal:
+        mask += -1.525 - 0.275 * b - 4.5
+    else:
+        mask += -1.525 - 0.175 * b - 0.5
+    return mask
 
-    for i in range(n):
-        db =  b[i] - b_m
-        mask = I \
-               - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
-               - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
-               - (17.0           ) * ( db      ) * (db >=  0.0) \
-               + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
-        if tonal:
-            mask += -1.525 - 0.275 * b[i] - 4.5
-        else:
-            mask += -1.525 - 0.175 * b[i] - 0.5
-        out[i] = out[i] + 10.0 ** (mask / 10.0)
+# k is the frequency line index (257 values), i a subsampling (112 values).
+k = arange(N / 2 + 1)
+f_k = k * df / N
+b_k = bark(f_k)
 
-    return 0
+k_i = r_[0:49, 49:97:2, 97:251:4]
+f_i = k_i * df / N
+b_i = bark(f_i)
+ATH_i = ATH(f_i)
+subband_i = array([int(s) for s in floor(f_i / (0.5 * df / 32))])
 
-# TODO: use the same sampling grid than the one used for FFT ?
-# (do no distinguish b and b_k) ???. Could that help us in reducing
-# the number of calls to excitation_pattern (30000 for 1 sec) ?
-# Not really, these are different issues. (that could be done to
-# simplify the code, but not optimize it).
-
-_DF = 44100.0
-_SUBBANDS = 32
-_DENSITY = 8
-_f = linspace(0.0, 0.5 * _DF, _SUBBANDS * (_DENSITY - 1) + 1)
-_b = bark(_f)
-_FRAME_LENGTH = 512
-_f_k = arange(_FRAME_LENGTH/2 + 1) * _DF / _FRAME_LENGTH
-_b_k = bark(_f_k)
-_ATH = ATH(_f)
-
-@cython.boundscheck(False)
-@cython.wraparound(False)
-cpdef mask_from_frame(frame):
+def mask_from_frame(frame):
     """
     Compute the mask function for a frame.
 
@@ -528,122 +635,146 @@ cpdef mask_from_frame(frame):
 
     """
 
-    cdef unsigned int i, k
-    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] mask
-    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] tonal
-    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] non_tonal
-    cdef unsigned int is_tonal
+    # compute the mask floor (linear scale)    
+    mask_i = 10.0 ** (ATH_i / 10.0)
 
-    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] b = _b
-    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] b_k = _b_k
-    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] ATH = _ATH
-    cdef unsigned int len_b = len(b)
-    cdef unsigned int len_b_k = len(b_k)
-    
-    cdef double I
-    cdef double _mask
-    cdef double db
-    cdef double b_k_k, b_i
+    # add the tonals and non-tonals mask values.
+    (k_t, P_t), (k_nt, P_nt) = maskers(frame)
+    for masker_index in arange(len(k_t)):
+        _b, _P = b_k[k_t[masker_index]], P_t[masker_index]
+        mask_i += 10.0 ** (excitation_pattern(b_i, b_m=_b, I=10.0*log10(_P), tonal=True) / 10.0)
+    for masker_index in arange(len(k_nt)):
+        _b, _P = b_k[k_nt[masker_index]], P_nt[masker_index]
+        mask_i += 10.0 ** (excitation_pattern(b_i, b_m=_b, I=10.0*log10(_P), tonal=False) / 10.0)
 
-    Ik_ = Ik(frame, window=hanning)
-    tonal, non_tonal = sort_maskers(Ik_, group=True)
+    # convert the resulting mask value to dB
+    mask_i = 10.0 * log10(mask_i)
 
-    mask = zeros(len_b)
-    for i in range(len_b):
-        mask[i] = 10.0 ** (ATH[i] / 10.0)
+    # select the lowest mask value in each of the 32 subbands.
+    subband_mask = [[] for _ in range(32)]
+    for i, _mask_i in enumerate(mask_i):
+        subband_mask[subband_i[i]].append(_mask_i)
+    for i, _masks in enumerate(subband_mask):
+        subband_mask[i] = amin(_masks)
+    return array(subband_mask)
 
-    for k in range(len_b_k):
-        b_k_k = b_k[k]
-        is_tonal = (tonal[k] > - np.inf)
-        if is_tonal:
-            I = tonal[k]
-        else:
-            I = non_tonal[k] 
-        for i in range(len_b):
-            b_i = b[i]
-            db =  b_i - b_k_k
-            _mask = I \
-                    - (11.0 - 0.40 * I) * (-db - 1.0) * (db <= -1.0) \
-                    - ( 6.0 + 0.40 * I) * (-db      ) * (db <   0.0) \
-                    - (17.0           ) * ( db      ) * (db >=  0.0) \
-                    + (       0.15 * I) * ( db - 1.0) * (db >=  1.0)
-            if is_tonal:
-                _mask += -1.525 - 0.275 * b_i - 4.5
-            else:
-                _mask += -1.525 - 0.175 * b_i - 0.5
-            mask[i] = mask[i] + 10.0 ** (_mask / 10.0)
+# TODO: control of frequency units (Hz/bark) and power unit (linear/dB)
+# TODO: display individual excitation pattern fof each masker
+# TODO: better display (fill-between + patch at low freq) of the ATH
+def display_maskers(frame, bark=True, dB=True):
+    # setup x and y-axis unit conversions
+    if bark:
+        convert_f = lambda f: psychoacoustics.bark(f)
+    else:
+        convert_f = lambda f: f
 
-    for i in range(len_b):
-        mask[i] = 10.0 * math_log10(mask[i])
+    if dB:
+        convert_P = lambda P: 10.0 * log10(P)
+    else:
+        convert_P = lambda P: P
 
-    subband_mask = array(split(mask, _DENSITY, overlap=1))
-    return amin(subband_mask, axis=1)
- 
+    # f array for high-resolution (1 Hz)
+    n = 22050
+    f = arange(n + 1) / float(n + 1) * 0.5 * df 
+    b = psychoacoustics.bark(f)
 
-#def sample_mask(mask, subbands=32, density=16, algo=amin):
-#    """
-#    Compute an array of mask levels in regularly spaced subbands.
+    k, P = raw_maskers(frame)
+    P = clip(P, 1e-100, 1e100) # convenience patch for plots
+    plot(convert_f(k * df / N), convert_P(P), "k:")
 
-#    Arguments
-#    ---------
+    #f_k = arange(N / 2 + 1) * df / N
+    #b_k = bark(f_k)
 
-#    - `mask`: a mask function (see `mask_from_frame`),
+    def k2b(k):
+        return bark(k * df / N)
 
-#    - `subbands`: the number of subbands,
+    (k_t, P_t), (k_nt, P_nt) = classify(k, P)
+    k_t_m, P_t_m = merge_tonals(k_t, P_t)
+    k_nt_m, P_nt_m = merge_non_tonals(k_nt, P_nt)
+    k_t_m_t, P_t_m_t = threshold(k_t_m, P_t_m)
+    k_nt_m_t, P_nt_m_t = threshold(k_nt_m, P_nt_m)
 
-#    - `density`: the number of mask values computed per subband,
+#    fill_between(k2b(k), -100.0*ones_like(P), clip(10.0*log10(P), -1000, 1000), color="k", alpha=0.3, label="raw")
+#    #plot(k2b(k_t), 10.0*log10(P_t), "r+", label="raw tonals")  
+#    #plot(k2b(k_nt), 10.0*log10(P_nt), "k+", label="raw non-tonals")  
+#     plot(k2b(k_t_m), 10.0*log10(P_t_m), "m+", label="merged tonals")  
+#    #plot(k2b(k_nt_m), 10.0*log10(P_nt_m), "b+", label="merged non-tonals")
 
-#    - `algo`: determines how the sequence of mask values for a subband 
-#      generates a single subband mask value. By default,
-#      the lowest value is picked (worst-case mask).
+#    # TODO: display only these finals maskers ?
+#    f_k = arange(N / 2 + 1) * df / N
+#    plot(k2b(k), ATH(f_k), "g:", label="ATH") 
+    plot(convert_f(k_t*df/N), convert_P(P_t), "k+")  
+    plot(convert_f(k_nt*df/N), convert_P(P_nt), "k+")     
+    plot(convert_f(k_t_m_t*df/N), convert_P(P_t_m_t), "mo", alpha=0.5, mew=0.0, label="tonals")  
+    plot(convert_f(k_nt_m_t*df/N), convert_P(P_nt_m_t), "bo", alpha=0.5, mew=0.0, label="non-tonals") 
 
-#    Returns
-#    -------
+    P_tot = 0.0
+    for _k, _P in zip(k_nt_m_t, P_nt_m_t):
+        _b = psychoacoustics.bark(_k * df / N)
+        ep = excitation_pattern(b, b_m=_b, I=10.0*log10(_P), tonal=False)
+        P_tot += 10.0 ** (ep / 10.0)
+        if not bark:
+            ep = 10.0 ** (ep / 10.0)
+        fill_between(convert_f(f), convert_P(1e-10*ones_like(f)), ep, color="b", alpha=0.2)
 
-#    - `levels`: a sequence of `subbands` mask levels.
+    for _k, _P in zip(k_t_m_t, P_t_m_t):
+        _b = psychoacoustics.bark(_k * df / N)
+        ep = excitation_pattern(b, b_m=_b, I=10.0*log10(_P), tonal=True)
+        P_tot += 10.0 ** (ep / 10.0)
+        if not bark:
+            ep = 10.0 ** (ep / 10.0)
+        fill_between(convert_f(f), convert_P(1e-10*ones_like(f)), ep, color="m", alpha=0.2)
+
+    if bark:
+        P_tot = 10 * log10(P_tot)
+    plot(convert_f(f), P_tot, "k-")
 
 
-#    Example
-#    -------
+# -------------------------------------------------------
+    # compute the mask floor (linear scale)    
+    mask_i = 10.0 ** (ATH_i / 10.0)
 
-#        >>> mask = lambda f: 96.0 * (f / 22050.0)
-#        >>> list(sample_mask(mask, subbands=4))
-#        [0.0, 24.0, 48.0, 72.0]
-#    """
-#    f = linspace(0.0, 0.5 * 44100.0, subbands * (density - 1) + 1)
-#    mask_ = array(split(mask(f), density, overlap=1))
-#    return algo(mask_, axis=1)
+    # add the tonals and non-tonals mask values.
+    (k_t, P_t), (k_nt, P_nt) = maskers(frame)
+    for masker_index in arange(len(k_t)):
+        _b, _P = b_k[k_t[masker_index]], P_t[masker_index]
+        mask_i += 10.0 ** (excitation_pattern(b_i, b_m=_b, I=10.0*log10(_P), tonal=True) / 10.0)
+    for masker_index in arange(len(k_nt)):
+        _b, _P = b_k[k_nt[masker_index]], P_nt[masker_index]
+        mask_i += 10.0 ** (excitation_pattern(b_i, b_m=_b, I=10.0*log10(_P), tonal=False) / 10.0)
 
-def display_mask(frame=None, interactive=True):
-    """
-    Display graphically the steps of the mask analysis of a frame of length 512.
-    """
-    if frame is None:
-        t = arange(N) * dt
-        f1 = 7040.0
-        f2 = 14080.0
-        frame = cos(2*pi*f1*t) + 0.01*cos(2*pi*f2*t) 
-    k = arange(257)
-    fk = k / 256.0 * 0.5 * 44100.0 
-    f = linspace(0.0, 0.5 * 44100.0, 1000)
-    gcf()
-    clf()
+    # convert the resulting mask value to dB
+    if dB:
+        mask_i = 10.0 * log10(mask_i)
+
+    plot(convert_f(f_i), mask_i, "k|", ms=100.0)
+
+# --------------------------------------------------------
+
+    m = mask_from_frame(frame)
+    b_subbands = psychoacoustics.bark((arange(32) + 0.5) * (0.5 * df / 32))
+    #plot(b_subbands, m, "ro", label="subband mask")
+    b_boundaries = ravel(split(psychoacoustics.bark(arange(33) * (0.5 * df / 32)), 2, overlap=1))
+    values = ravel([[_m, _m] for _m in m])
+    plot(b_boundaries, values, "r")
+    #fill_between(b_boundaries, -100*ones_like(values), values, color="r", alpha=0.3)
+
+    if bark:
+        x_min, x_max = 0, psychoacoustics.bark(0.5 * df)
+        xticks(arange(25 + 1))
+    else:
+        x_min, x_max = 0.0, 22050.0
+        xticks(arange(0.0, 22050.0, 500.0))
+    if dB:
+        y_min, y_max = -10.0, 100.0
+    else:
+        y_min, y_max = 0.1, 10.0**10
+
+    axis([x_min, x_max, y_min, y_max])
+
+
     grid(True)
-    Ik_ = Ik(frame, window=hanning)
-    tonal_Ik, non_tonal_Ik = sort_maskers(Ik_, group=False)
-    plot(fk, tonal_Ik, "m+", label="tonal maskers")
-    plot(fk, non_tonal_Ik, "b+", label="non-tonal maskers")
-    plot(f, ATH(f), "k--", label="ATH")
-    mask = mask_from_frame(frame)
-    plot(f, mask(f), "k", label="mask")
-    mask_array = sample_mask(mask, subbands=32)
-    array_x2 = kron(mask_array, [1.0, 1.0])
-    f_edges = ravel(split(arange(32 + 1) / 32.0 * 0.5 * 44100.0, 2, overlap=1))
-    plot(f_edges, array_x2, "k", linewidth=1.5, label="subband mask")
-    xlabel("frequency $f$ [Hz]")
-    ylabel("mask level [dB]")
-    legend(loc=4)
-    axis([0.0, 20000.0, -10.0, 100.0])
+    #legend(loc=3)
 
 #
 # Subband Data Vector (Scale Factors) Quantizers
@@ -677,10 +808,10 @@ def allocate_bits(frames, mask, bit_pool=_bit_pool):
       - `bits`: the number of bits allocated in each subband.    
     
     """
-    frames = array(frames)
-    assert shape(frames) == (12, 32)
-    mask = array(mask)
-    assert shape(mask) == (32,)
+#    frames = array(frames)
+#    assert shape(frames) == (12, 32)
+#    mask = array(mask)
+#    assert shape(mask) == (32,)
  
     sf_quantizer = ScaleFactor(_scale_factors)
     sf_subband = zeros(32)
@@ -688,21 +819,21 @@ def allocate_bits(frames, mask, bit_pool=_bit_pool):
         sf_index = sf_quantizer.index(frame)
         sf_subband[subband] = _scale_factors[sf_index]
 
-    bits = 32 * [0]
+    bits = zeros(32, dtype=uint8)
     # rk: bits[subband] should be limited to 15 bits (not implemented)
-    bit_pool_ = bit_pool
-    while bit_pool_ != 0:
-        delta = 2.0 * sf_subband / 2 ** array(bits)
-        noise_level = 96.0 + 10 * log10((delta ** 2) / 12.0)
-        noise_to_mask = noise_level - mask
+    delta = 2.0 * sf_subband / 2 ** bits
+    noise_level = 96.0 + 10 * log10((delta ** 2) / 12.0)
+    noise_to_mask = noise_level - mask
+    delta_dB = 10.0 * log10(2.0)
+    while bit_pool != 0:
         subband = argmax(noise_to_mask)
-        bits[subband] += 1
-        bit_pool_ = bit_pool_ - 1
+        noise_to_mask[subband] -= delta_dB
+        bit_pool = bit_pool - 1
   
-    assert sum(bits) == bit_pool # check that all bits have been allocated
-    return array(bits)
+    #assert sum(bits) == bit_pool # check that all bits have been allocated
+    return bits
 
-# TODO: transfer to quanizers ? Too specific for that ? Transfer a part of it ?
+# TODO: transfer to quantizers ? Too specific for that ? Transfer a part of it ?
 class SubbandQuantizer(Quantizer):
     def __init__(self, mask=None, bit_pool=_bit_pool):
         self.mask = mask
@@ -831,7 +962,7 @@ def demo(data=None, bit_pool=_bit_pool, play=False, display=False):
 
 def demo2(data=None, report=False):
     if data is None:
-        data = square(1760.0, 512*100)
+        data = square(1760.0, 44100)
     t = arange(len(data)) * dt
     length = len(t)
     assert length >= 1024
