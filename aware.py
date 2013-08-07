@@ -265,7 +265,8 @@ def excitation_pattern(b, b_m, I, tonal):
     The spread function and attenuation factors are from MPEG-1 Audio Model 1.
 
     Arguments
-    --------
+    ---------
+
       - `b`: scalar or array of frequencies in barks,
       - `b_m`: masker frequency (in barks),
       - `I`: masker power (in dB),
@@ -584,7 +585,7 @@ class SubbandQuantizer(Quantizer):
 # ------------------------------------------------------------------------------
 #
 
-# TODO: transfer to bitstream
+# TODO: transfer to bitstream ? coders ? anyway, this is not aware-specific.
 class uint(object):
     def __init__(self, num_bits):
         self.num_bits = num_bits
@@ -643,13 +644,17 @@ def on_breakpoint(progress, elapsed, remain):
 #    sequence of hetergeneous tasks ? That would require a rewrite that
 #    merges everything in a single loop. Yeah, I need that.
 @logger.tag("aware.compress")
-#@breakpoint.breakpoint(dt=10.0, handler=on_breakpoint)
+@breakpoint.breakpoint(dt=10.0, handler=on_breakpoint)
 def compress(data, bit_pool=BIT_POOL, snapshot=None):
 
     logger.info("starting compression")
     data = np.array(data)
 
-    # Synchronisation
+    # TODO: document new scheme: we prepare the (subband + mask) data alignment 
+    #       first, THEN we deal with it in a single loop (to make breakpoint
+    #       usable)
+
+    # Synchronization
     # --------------------------------------------------------------------------
     #
     # The implementation should be careful to synchronize the input signal,
@@ -660,7 +665,7 @@ def compress(data, bit_pool=BIT_POOL, snapshot=None):
     #     to compensate for the advance induced by our implementation of
     #     the polyphase analysis filter.
     #
-    #  2. Given that compensation the subband data is delayed with respect to 
+    #  2. Given that compensation, the subband data is delayed with respect to 
     #     the input signal by N // 2 samples as a consequence of the causal 
     #     implementation of the analysis filters. We process this early data
     #     in the subbands anyway for a correct synthesis filter warm-up.
@@ -691,41 +696,51 @@ def compress(data, bit_pool=BIT_POOL, snapshot=None):
     stream = bitstream.BitStream()
     stream.write("AWAR")
     stream.write(len_data, np.uint32)
-    stream.write(num_channels, uint8)
+    stream.write(num_channels, np.uint8)
 
     for num_channel in range(num_channels):
         channel_data = data[num_channel]
 
-        # Compute the masks
+        # Compute the masks (prepare data for)
         overlap = N_FFT - L
         head = np.zeros(N // 2 + overlap // 2)
         tail = np.zeros(N + L + overlap // 2) # covers the worst-case
         channel_mask_sync = np.r_[head, channel_data, tail]
-        mask_frames = split(channel_mask_sync, N_FFT, zero_pad=True, overlap=(N - L)) 
-        masks = [mask_from_frame(frame) for frame in mask_frames]
+        mask_frames = split(channel_mask_sync, N_FFT, zero_pad=True, overlap=(N_FFT - L)) 
+        #masks = [mask_from_frame(frame) for frame in mask_frames]
 
-        # Apply the analysis filter bank.
+        # Apply the analysis filter bank (prepare data for)
         head = np.zeros(M-1)
         tail = np.zeros(N)
         data_filter_sync = np.r_[head, channel_data, tail]
         # enforce a data length that is a multiple of L
         extra_tail = np.zeros((L - len(data_filter_sync) % L) % L)
         data_filter_sync = np.r_[data_filter_sync, extra_tail]
-        analyze = Analyzer(MPEG.A, dt=MPEG.dt)
+        #analyze = Analyzer(MPEG.A, dt=MPEG.dt)
         frames = np.array(split(data_filter_sync, MPEG.M, zero_pad=True))
-        subband_frames = array([analyze(frame) for frame in frames])
-
+        #subband_frames = array([analyze(frame) for frame in frames])
 
         # Encode this data into the binary stream
         num_frames = int(np.ceil((len_data + N) / L))
+        analyze = Analyzer(MPEG.A, dt=MPEG.dt)
+
+        count, stop = 0, 1
         for i in range(num_frames):
-            subband_quantizer = SubbandQuantizer(masks[i], bit_pool=bit_pool)
-            subband_frame = subband_frames[i*(L // M) : (i+1)*(L // M)]
+            mask = mask_from_frame(mask_frames[i])
+            subband_quantizer = SubbandQuantizer(mask, bit_pool=bit_pool)
+            subband_frame = array([analyze(frames[j]) for j in range(i*(L//M), (i+1)*(L//M))])
+            #subband_frame = subband_frames[i*(L // M) : (i+1)*(L // M)]
             subband_codes = subband_quantizer.encode(subband_frame)
             for num_bits, sf_index, codes in subband_codes:
                 stream.write(max(0, num_bits - 1), uint(4))
                 stream.write(sf_index, uint(6))
                 stream.write(codes, uint(num_bits))
+
+            count += 1
+            if count >= stop:
+                progress = (num_channel + (i + 1) / num_frames) / num_channels
+                count = 0
+                stop = stop * (yield progress)
 
     padding = ((8 - len(stream) % 8) % 8) * [False]
     stream.write(padding)
@@ -735,8 +750,7 @@ def compress(data, bit_pool=BIT_POOL, snapshot=None):
 
     logger.info("ending compression")
 
-    return stream
-    #yield (1.0, stream)
+    yield (1.0, stream)
 
 @logger.tag("aware.decompress")
 @breakpoint.breakpoint(dt=10.0, handler=on_breakpoint)
