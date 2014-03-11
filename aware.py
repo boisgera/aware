@@ -637,12 +637,8 @@ bitstream.register(uint, writer=write_uint_factory, reader=read_uint_factory)
 def on_breakpoint(progress, elapsed, remain):
     logger.info("time remaining: {remain:.1f} secs.")
 
-# factor out some helper functions ? (filter, bit alloc., etc.)
-# document synchronization in a better way ?
 
-# Q: How can I estimate the remaining time reliably when the algo. is a
-#    sequence of hetergeneous tasks ? That would require a rewrite that
-#    merges everything in a single loop. Yeah, I need that.
+# TODO: bit_allocator argument
 @logger.tag("aware.compress")
 @breakpoint.breakpoint(dt=10.0, handler=on_breakpoint)
 def compress(data, bit_pool=BIT_POOL, snapshot=None):
@@ -876,7 +872,9 @@ Return the following message:
 def main(args=None):
     if args is None:
         args = sys.argv[1:]
-    spec = "bitpool= help test verbose"
+    spec = "bitpool= help verbose test"
+
+    # TODO: solve issue with filenames with spaces
     options, filenames = script.parse(spec, args)
 
     verbosity = len(options.verbose)
@@ -899,6 +897,11 @@ def main(args=None):
         raise ExceptionType(message)
     logger.error.set_hook(_error_hook)
 
+    if options.bitpool:
+        bit_pool = int(script.first(options.bitpool))
+    else:
+        bit_pool = BIT_POOL
+
     if len(filenames) != 1:
         raise ValueError("only one filename can be specified")
     else:
@@ -906,15 +909,11 @@ def main(args=None):
 
     parts = filename.split(".")
     if len(parts) == 1:
-        raise ValueError("error: no filename extension found, use 'wav' or 'awr'.")
+        error = "no filename extension found, use 'wav' or 'awr'"
+        raise ValueError(error)
     else:
         basename = ".".join(parts[:-1])
         extension = parts[-1]
-
-    if options.bitpool:
-        bit_pool = int(script.first(options.bitpool))
-    else:
-        bit_pool = BIT_POOL
 
     if extension == "wav":
         data = wave.read(filename)
