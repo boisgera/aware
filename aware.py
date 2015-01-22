@@ -6,6 +6,7 @@ Aware -- Perceptual Audio Coder
 
 # Python 2.7 Standard Library
 from __future__ import division
+import argparse
 import doctest
 import inspect
 import pickle
@@ -21,14 +22,13 @@ from pylab import *; seterr(all="ignore")
 # Digital Audio Coding
 import bitstream
 import breakpoint
-import logger
-import script
-from filters import MPEG, Analyzer, Synthesizer
-from frames import split
-import psychoacoustics
-from psychoacoustics import ATH, bark, hertz, Mask
-from quantizers import Quantizer, ScaleFactor, Uniform
-import wave
+import logfile
+from audio.filters import MPEG, Analyzer, Synthesizer
+from audio.frames import split
+import audio.psychoacoustics as psychoacoustics
+from audio.psychoacoustics import ATH, bark, hertz, Mask
+from audio.quantizers import Quantizer, ScaleFactor, Uniform
+import audio.wave as wave
 
 #
 # Metadata
@@ -101,7 +101,7 @@ def display_subbands(data):
     # Add zeros at the head to implement strictly the polyphase filter
     # and add zeros at the tail to account for the filter-induced delay.
     data = r_[np.zeros(M-1), data, np.zeros(N)]
-    frames = np.array(split(data, MPEG.M, zero_pad=True))
+    frames = np.array(split(data, MPEG.M, pad=True))
     subband_frames = transpose([analyze(frame) for frame in frames])
     assert shape(subband_frames)[0] == M
     for i, data in enumerate(subband_frames):
@@ -481,7 +481,6 @@ def display_maskers(frame, bark=True, dB=True):
 
 # TODO: display bit allocation with a stackplot. Warning: overloaded in _aware
 
-@logger.tag("aware.allocate_bits")
 def allocate_bits(frames, mask, bit_pool=BIT_POOL):
     """
     Arguments
@@ -634,16 +633,22 @@ bitstream.register(uint, writer=write_uint_factory, reader=read_uint_factory)
 #   - timing to see if i can get rid of the shortcut that generates no stream,
 #     or if i need to enforce that optim.
 
-def on_breakpoint(progress, elapsed, remain):
-    logger.info("time remaining: {remain:.1f} secs.")
+def log_remaining():
+    def handler(**kwargs):
+        remaining = kwargs.get("remaining")
+        logfile.tag("audio.shrink")
+        logfile.info("time remaining: {remaining:.1f} secs.")
+    return handler
+
+log_ETA = breakpoint.function(on_yield=log_remaining, progress=True, dt=10.0)
+
 
 
 # TODO: bit_allocator argument
-@logger.tag("aware.compress")
-@breakpoint.breakpoint(dt=10.0, handler=on_breakpoint)
+@log_ETA
 def compress(data, bit_pool=BIT_POOL, snapshot=None):
 
-    logger.info("starting compression")
+    logfile.info("starting compression")
     data = np.array(data)
 
     # TODO: document new scheme: we prepare the (subband + mask) data alignment 
@@ -702,7 +707,7 @@ def compress(data, bit_pool=BIT_POOL, snapshot=None):
         head = np.zeros(N // 2 + overlap // 2)
         tail = np.zeros(N + L + overlap // 2) # covers the worst-case
         channel_mask_sync = np.r_[head, channel_data, tail]
-        mask_frames = split(channel_mask_sync, N_FFT, zero_pad=True, overlap=(N_FFT - L)) 
+        mask_frames = split(channel_mask_sync, N_FFT, pad=True, overlap=(N_FFT - L)) 
         #masks = [mask_from_frame(frame) for frame in mask_frames]
 
         # Apply the analysis filter bank (prepare data for)
@@ -713,7 +718,7 @@ def compress(data, bit_pool=BIT_POOL, snapshot=None):
         extra_tail = np.zeros((L - len(data_filter_sync) % L) % L)
         data_filter_sync = np.r_[data_filter_sync, extra_tail]
         #analyze = Analyzer(MPEG.A, dt=MPEG.dt)
-        frames = np.array(split(data_filter_sync, MPEG.M, zero_pad=True))
+        frames = np.array(split(data_filter_sync, MPEG.M, pad=True))
         #subband_frames = array([analyze(frame) for frame in frames])
 
         # Encode this data into the binary stream
@@ -736,7 +741,9 @@ def compress(data, bit_pool=BIT_POOL, snapshot=None):
             if count >= stop:
                 progress = (num_channel + (i + 1) / num_frames) / num_channels
                 count = 0
-                stop = stop * (yield progress)
+                x = (yield (progress, None))
+                if x is not None:
+                    stop = x * stop
 
     padding = ((8 - len(stream) % 8) % 8) * [False]
     stream.write(padding)
@@ -744,14 +751,13 @@ def compress(data, bit_pool=BIT_POOL, snapshot=None):
     if snapshot is not None:
         snapshot.update(locals())
 
-    logger.info("ending compression")
+    logfile.info("ending compression")
 
     yield (1.0, stream)
 
-@logger.tag("aware.decompress")
-@breakpoint.breakpoint(dt=10.0, handler=on_breakpoint)
+@log_ETA
 def decompress(stream, snapshot=None):
-    logger.info("starting decompression")
+    logfile.info("starting decompression")
     if stream.read(str, 4) != "AWAR":
         raise ValueError("invalid format")
     len_data = stream.read(np.uint32)
@@ -759,7 +765,7 @@ def decompress(stream, snapshot=None):
 
     data = np.zeros((num_channels, len_data))
     for num_channel in range(num_channels):
-        logger.info("channel {num_channel}")
+        logfile.info("channel {num_channel}")
         subband_quantizer = SubbandQuantizer()
         #subband_frames = []
         num_frames = int(np.ceil((len_data + N) / L))
@@ -782,13 +788,15 @@ def decompress(stream, snapshot=None):
             if count >= stop:
                 progress = (num_channel + (i + 1) / num_frames) / num_channels
                 count = 0
-                stop = stop * (yield progress)
+                x = (yield (progress, None))
+                if x is not None:
+                    stop = x * stop
         data[num_channel] = channel_data[N:N+len_data]
 
     if snapshot is not None:
         snapshot.update(locals())
 
-    logger.info("ending decompression")
+    logfile.info("ending decompression")
 
     yield (1.0, data)
 #
@@ -837,7 +845,7 @@ def test(verbose=False):
     """
     Run the doctests of this module.
     """
-    return doctest.testmod(verbose)
+    return doctest.testmod(verbose=verbose)
 
 #
 # Command-Line Interface
@@ -847,65 +855,61 @@ def test(verbose=False):
 # TODO:
 #   - help / usage
 #   - output (check consistent extension)
-#   - verbosity control (need logger code into this source)
+#   - verbosity control (need logfile code into this source)
 #     + compute compression ratio, bit-rate, that kind of thing first?
 #     + breakpoint code ? 
 #   - round-trip / replace the original wave file
 
-def help():
-    """
-Return the following message:
+def main():
 
-    usage:
+    description = "AWARE Perceptual Coder"
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("filename", nargs="?", type=str,
+                         help = "filename (WAVE or AWR file")
+    parser.add_argument("-v", "--verbose", 
+                        action  = "count", 
+                        default = 0,
+                        help    = "display more information")
+    parser.add_argument("-s", "--silent",
+                        action  = "count", 
+                        default = 0,
+                        help    = "display less information")
+    parser.add_argument("-b", "--bitpool",
+                        type = int,
+                        default = 112,
+                        help = "set the bitpool size (default: 112)")
+    parser.add_argument("-t", "--test", 
+                        action="store_true", 
+                        help = "perform self-test and exit")
+    args = parser.parse_args()
 
-        aware [OPTIONS] FILENAME
+    verbosity = args.verbose - args.silent
+    logfile.config.level = verbosity
+    def format(logfile, message, tag, date):
+        tag = tag or ""
+        return " {0:<9} | {1:<18} | {2}\n".format(logfile.name, tag, message)
+    logfile.config.format = format
 
-    options:
-
-        -b BITPOOL / --bitpool BITPOOL .............. set the bit pool size (default: 112)
-        -h / --help ................................. display help and exit
-        -v / --verbose .............................. enable verbose mode (may be repeated)
-        -t / --test ................................. perform self-tests and exit
-"""
-    return "\n".join(line[4:] for line in inspect.getdoc(help).splitlines()[2:])
-
-def main(args=None):
-    if args is None:
-        args = sys.argv[1:]
     spec = "bitpool= help verbose test"
 
     # TODO: solve issue with filenames with spaces
-    options, filenames = script.parse(spec, args)
+    filename = args.filename
+    verbosity = args.verbose - args.silent
+    bit_pool = args.bitpool
 
-    verbosity = len(options.verbose)
-    verbose = verbosity > 0
-
-    if options.help or (not filenames and not options):
-        print help()
-        sys.exit(0)
-
-    if options.test:
-        results = test(verbose=verbose)
+    if args.test:
+        results = test(verbose=verbosity>0)
         sys.exit(results.failed)
 
-    logger.config.level = verbosity
-    def _format(channel, message, tag):
+    logfile.config.level = verbosity
+    def format(logfile, message, tag, date):
         tag = tag or ""
-        return " {0!r:<9} | {1:<18} | {2}\n".format(channel, tag, message)
-    logger.config.format = _format
-    def _error_hook(message, ExceptionType=ValueError):
-        raise ExceptionType(message)
-    logger.error.set_hook(_error_hook)
+        return " {0:<9} | {1:<18} | {2}\n".format(logfile.name, tag, message)
+    logfile.config.format = format
 
-    if options.bitpool:
-        bit_pool = int(script.first(options.bitpool))
-    else:
-        bit_pool = BIT_POOL
-
-    if len(filenames) != 1:
-        raise ValueError("only one filename can be specified")
-    else:
-        filename = filenames[0]
+    if filename is None:
+        parser.print_help()
+        sys.exit(1)
 
     parts = filename.split(".")
     if len(parts) == 1:
@@ -930,9 +934,7 @@ def main(args=None):
         raise ValueError(error.format(extension))
 
 if __name__ == "__main__":
-    if "--test" in sys.argv: # TODO: migrate to main
-        test()
-    else:
-        main(sys.argv[1:])
+    main()
+
 
 
