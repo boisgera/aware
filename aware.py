@@ -933,6 +933,96 @@ def main():
         error = "unknown extension {0!r}, use 'wav' or 'awr'."
         raise ValueError(error.format(extension))
 
+
+#
+# Aware Compression
+# ------------------------------------------------------------------------------
+#
+
+def demo(data=None, bit_pool=BIT_POOL, play=True, display=True):
+    if data is None:
+        data = square(1760.0, 512*100)
+
+    assert len(data) >= 1024    
+    
+    # Compute the single mask used for every bit allocation.
+    reference_frame = data[:512]
+    length = len(data)
+    mask = mask_from_frame(reference_frame) #sample_mask(mask_from_frame(reference_frame), 32)
+
+    if display:
+        figure()
+        display_maskers(reference_frame)
+        figure()
+        display_subbands(data)
+
+    # Apply the analysis filter bank.
+    analyze = Analyzer(MPEG.A, dt=MPEG.dt)
+    data = r_[data, zeros(512)] # take into account the delay:
+    # without this extra frame, we may not have enough output values.
+    frames = array(split(data, MPEG.M, pad=True))
+    subband_frames = array([analyze(frame) for frame in frames])
+
+    # Make sure we have an entire numbers of 12-sample frames.
+    remainder = shape(subband_frames)[0] % 12
+    if remainder:
+        subband_frames = r_[subband_frames, zeros((12-remainder, 32))]
+
+    # Quantize the data in each subband.
+    quant_subband_frames = []
+    subband_quantizer = SubbandQuantizer(mask, bit_pool=bit_pool)
+    for i in range(shape(subband_frames)[0] // 12):
+        subband_frame = subband_frames[i*12:(i+1)*12]
+        quant_subband_frames.append(subband_quantizer(subband_frame))
+
+    mean_bits = mean(subband_quantizer.bits, axis=0)
+    if display:
+        figure()
+        bar(arange(32.0)-0.4, mean_bits)
+        xlabel("subband number")
+        ylabel("number of bits (mean)")
+        title("Bit Allocation Profile")
+        grid(True)
+        axis([-1, 32, 0, max(mean_bits) + 1])
+
+    # Reconstruct the approximation of the original audio data 
+    synthesize = Synthesizer(MPEG.S, dt=MPEG.dt, gain=MPEG.M)
+    output = []
+    for frame_12 in quant_subband_frames:
+        for frame in frame_12:
+            output.extend(synthesize(frame))
+
+    # Synchronize input and output data.
+    _delay = 481 # magic number ...
+    output = output[_delay:length+_delay]
+    
+    if display:
+        figure()
+        plot(arange(512, 1024), data[512:1024], "k-o", ms=3.0, label="original data")
+        plot(arange(512, 1024), output[512:1024], "r-o", ms=3.0, alpha=0.7, label="compressed data")
+        xlabel("sample number")
+        ylabel("sample value")
+        grid(True)
+        axis("tight")
+        legend()
+        title("Waveforms before/after compression (sample)")
+        
+    if play:
+        sh.rm("-rf", "tmp"); sh.mkdir("tmp")
+        wave.write(data, "tmp/sound.wav")
+        wave.write(output, "tmp/sound-aware.wav")
+        print "playing the original sound ..."
+        sys.stdout.flush()
+        time.sleep(1.0)
+        sh.play("tmp/sound.wav")
+        print "playing the encoded sound ..."
+        sys.stdout.flush()
+        time.sleep(1.0)
+        sh.play("tmp/sound-aware.wav")
+
+    if display:
+        show()
+
 if __name__ == "__main__":
     main()
 
